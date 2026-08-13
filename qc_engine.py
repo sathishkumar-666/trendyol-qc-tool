@@ -1,35 +1,41 @@
 #!/usr/bin/env python3
 """
-Trendyol Marketplace QC Tool
-=============================
-Checks a Trustana product export (CSV) against Trendyol's Seller Information
-Center listing rules (see Trendyol_MP_QC_Rules.md, the source this tool was
-built from) and produces an Excel QC report.
+Trustana AI Content Verifier for MP
+====================================
+Checks a Trustana product export (CSV) against a marketplace's listing
+rules and produces an Excel QC report. Currently supports:
+
+    - trendyol  (see Trendyol_MP_QC_Rules.md)
+    - noon      (see Noon_MP_QC_Rules.md)
 
 Usage:
-    python3 trendyol_qc_tool.py <trustana_export.csv> <output_report.xlsx> [--verify-images] [--max-image-checks N]
+    python3 qc_engine.py <trustana_export.csv> <output_report.xlsx> --marketplace trendyol|noon [--verify-images] [--max-image-checks N]
 
-    --verify-images       Attempt to download every product image and check
-                           real format / file size / resolution against
-                           Trendyol's technical spec. Requires outbound
+    --marketplace          Which marketplace's rules to check against.
+                           Required.
+    --verify-images        Attempt to download every product image and check
+                           real format / file size / resolution against the
+                           marketplace's technical spec. Requires outbound
                            network access to the image hosting domain(s).
                            If the first few attempts fail (e.g. sandboxed /
                            allow-listed network), image verification is
                            automatically skipped for the rest of the run and
                            the report notes this rather than reporting false
                            passes.
-    --max-image-checks N  Cap on how many images to actually download when
+    --max-image-checks N   Cap on how many images to actually download when
                            --verify-images is set (default 500). Protects
                            against very large exports.
 
 Column mapping (adjust COLUMN_MAP below if your Trustana export uses
 different header names):
     sku, product_name, brand, model_code, category, google_category,
-    images, barcode, title, description, price, sale_price, stock
+    images, barcode, title, description, price, stock, warranty_type
 
-Every check function below is annotated with the rule ID / section from the
-QC rules doc it implements, so this file can be audited and updated when
-Trendyol changes its rules.
+Adding a new marketplace: add a new MarketplaceConfig to MARKETPLACES near
+the top of this file. Every check function below takes the active config
+as a parameter rather than hardcoding thresholds, so a new marketplace
+usually needs no changes to the check logic itself — just a new config
+entry with that marketplace's numbers plugged in.
 """
 
 import sys
@@ -37,6 +43,7 @@ import csv
 import re
 import io
 import argparse
+from dataclasses import dataclass, field
 from collections import defaultdict, Counter
 from datetime import datetime
 
@@ -49,6 +56,9 @@ except ImportError:
 
 # ---------------------------------------------------------------------------
 # Column mapping — edit here if the Trustana export header names change.
+# Shared across marketplaces: both Trendyol and noon read from the same
+# Trustana export shape. Fields a given marketplace doesn't use (e.g.
+# warranty_type for Trendyol) are simply ignored for that marketplace.
 # ---------------------------------------------------------------------------
 COLUMN_MAP = {
     "sku": "SKU",
@@ -63,16 +73,30 @@ COLUMN_MAP = {
     "description": "Description [EN]/Marketing",
     "price": "Price",
     "stock": "Stock",
+    "warranty_type": "Warranty Type [EN]/Marketing",
 }
 
 HARD = "HARD"
 SOFT = "SOFT"
 
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+LONG_DIGIT_RUN_RE = re.compile(r"\b\d{9,}\b")
+PHONE_LIKE_RE = re.compile(r"\b\d{2,4}[-.\s]\d{3}[-.\s]\d{3,4}\b")
+EMOJI_RE = re.compile(
+    "[" "\U0001F300-\U0001FAFF" "\U00002600-\U000027BF" "\U0001F1E6-\U0001F1FF" "]"
+)
+HTML_TAG_RE = re.compile(r"<\s*(p|br|ul|li|ol|div|span|strong|b|i|table|tr|td)[\s/>]", re.I)
+
+
 # ---------------------------------------------------------------------------
-# Banned-content word lists — Rules doc §3 (banned content) and §7 (banned
-# products / health-claim vocabulary). Non-exhaustive by Trendyol's own
-# admission (see Rules doc §10 "Gaps") — extend as real rejections surface
-# more terms.
+# Banned-content word lists. Each marketplace's config picks which of these
+# groups apply. All non-exhaustive by the marketplaces' own admission (see
+# the rules docs' "Gaps" sections) — extend as real rejections surface more
+# terms. Highly ambiguous/context-dependent banned categories (e.g. political
+# symbolism, religious-sensitivity content) are deliberately NOT keyword-
+# scanned here — false positive risk is too high for a naive scanner, and
+# they need actual category-level human review. See each rules doc's "Gaps"
+# section for what's excluded and why.
 # ---------------------------------------------------------------------------
 HEALTH_CLAIM_TERMS = [
     "cancer", "tumor", "diabetes", "diabetic", "cures", "cure for", "curing",
@@ -97,46 +121,235 @@ PRICE_SHIPPING_PROMO_TERMS = [
     "use code", "sale price", "special campaign",
 ]
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-LONG_DIGIT_RUN_RE = re.compile(r"\b\d{9,}\b")
-PHONE_LIKE_RE = re.compile(r"\b\d{2,4}[-.\s]\d{3}[-.\s]\d{3,4}\b")
-EMOJI_RE = re.compile(
-    "[" "\U0001F300-\U0001FAFF" "\U00002600-\U000027BF" "\U0001F1E6-\U0001F1FF" "]"
-)
-BARCODE_FORBIDDEN_CHARS_RE = re.compile(r"[?/&%+^'*_]")
-HTML_TAG_RE = re.compile(r"<\s*(p|br|ul|li|ol|div|span|strong|b|i|table|tr|td)[\s/>]", re.I)
-
-ALLOWED_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp")
-
-
-# ---------------------------------------------------------------------------
-# Rule catalogue (for the "Rules Reference" sheet — keeps the report
-# self-documenting and traceable back to the source doc).
-# ---------------------------------------------------------------------------
-RULE_CATALOGUE = [
-    # id, name, severity, source section, condition summary
-    ("title_length", "Title length", HARD, "§1, §9.1", "Title 3-200 chars excluding brand name; must be present."),
-    ("description_length", "Description length", HARD, "§1, §9.2", "Plain text <=4000 chars, HTML <=30000 chars; must be present."),
-    ("barcode_format", "Barcode / EAN format", HARD, "§1, §9.3", "2-40 chars, no ?/&%+^'*_ characters; must be present."),
-    ("model_code_format", "Model code format", HARD, "§1, §9.4", "1-40 chars, no URL/email; must be present."),
-    ("image_count", "Image count", HARD, "§1, §2, §9.5", "1-8 images required."),
-    ("image_url_format", "Image URL format", HARD, "§2, §9.6", "https, direct file link, no spaces/parentheses, plausible image extension."),
-    ("image_technical_spec", "Image technical spec (downloaded)", HARD, "§2, §9.6", "JPEG/PNG/WEBP, 1KB-10MB, 860x574-2000x2000px (requires --verify-images)."),
-    ("banned_words", "Banned / restricted content", HARD, "§3, §7, §9.7", "Health claims, off-platform links/contact info, price/shipping/promo language in title or description."),
-    ("price_consistency", "Price consistency", HARD, "§1, §9.8", "Sale price must not exceed original price (skipped if not present in export)."),
-    ("category_present", "Category presence", HARD, "§1, §9.9", "Category must be present and non-trivial."),
-    ("variant_duplicate", "Barcode / SKU duplication", HARD, "§1, §9.10", "Barcode must not be reused across unrelated SKUs; SKU must be unique."),
-    ("category_depth_heuristic", "Category taxonomy depth (heuristic)", SOFT, "§1, §4, §9.9", "Category path looks shallow / possibly not a leaf node — needs manual check against Trendyol's live category tree (not available in this export)."),
-    ("title_source_fallback", "Title sourced from Product Name (fallback)", SOFT, "(derived)", "Title [EN]/Marketing is blank; Product Name was used as a stand-in for QC purposes — flagged so the real marketing title still gets populated."),
-    ("title_quality", "Title quality", SOFT, "§5, §9.11", "No ALL CAPS, no repeated words, no emoji, not just the category name, brand name excluded, no excess punctuation."),
-    ("description_quality", "Description quality", SOFT, "§5, §9.12", "Prefer bullet points on long text; no internal SKU/stock-code leakage; no emoji/caps abuse."),
-    ("duplicate_title", "Duplicate title across SKUs", SOFT, "(derived)", "Same exact title reused for multiple distinct products/barcodes — possible template copy-paste."),
-    ("image_content_heuristic", "Image content quality (heuristic)", SOFT, "§2, §9.13", "Corner-pixel brightness as a rough plain-background proxy; reused image URL across SKUs (requires --verify-images for the background check)."),
-    ("content_relevance", "Category matches product name/title/description", SOFT, "§4, §9.15", "At least one significant keyword (or known synonym) from the last two levels of the assigned category should appear in Product Name, Title, or Description — a proxy for 'is this the right category for this product'."),
-    ("title_description_relevance", "Title matches description", SOFT, "(derived)", "Title and Description should share at least one significant keyword — a proxy for 'is the correct description attached to this title', catching copy-paste/template mismatches."),
+COMPETITOR_MENTION_TERMS = [
+    "amazon", "namshi", "noon.com/", "trendyol.com", "available on ebay",
+    "available on shopify", "other marketplaces",
 ]
-RULE_SEVERITY = {r[0]: r[2] for r in RULE_CATALOGUE}
-RULE_NAME = {r[0]: r[1] for r in RULE_CATALOGUE}
+
+# noon Rules doc §4: prohibited-product categories. Limited to reasonably
+# unambiguous, high-signal keywords — see the module docstring above for why
+# the most context-dependent categories are intentionally excluded.
+NOON_PROHIBITED_PRODUCT_TERMS = [
+    "narcotic", "cocaine", "heroin", "controlled substance",
+    "sim box", "gps tracker", "jamming device", "signal jammer",
+    "counterfeit", "replica watch", "replica bag",
+    "endangered species", "ivory", "rhino horn",
+    "ammunition", "firearm", "handgun", "assault rifle", "explosive device",
+    "radioactive material", "human organ",
+    "prescription drug", "unregistered medicine",
+    "tobacco", "cigarette", "e-cigarette", "vape liquid",
+    "poppy seed", "counterfeit currency", "fake currency",
+    "gambling equipment", "lottery ticket",
+    "sex toy", "vibrator", "libido enhancer", "male enhancement supplement",
+    "pet food", "live animal for sale",
+]
+
+BARCODE_FORBIDDEN_CHARS_TRENDYOL_RE = re.compile(r"[?/&%+^'*_]")
+BARCODE_FORBIDDEN_CHARS_NOON_RE = re.compile(r"[+/\-%&\s]")
+
+
+# ---------------------------------------------------------------------------
+# Marketplace configuration
+# ---------------------------------------------------------------------------
+@dataclass
+class MarketplaceConfig:
+    key: str
+    display_name: str
+    rules_doc: str
+
+    # Title
+    title_min_len: int
+    title_max_len: int
+    title_length_excludes_brand: bool  # Trendyol: yes (rule text says "excluding brand"). noon: no (brand simply banned outright, length is on the raw title).
+
+    # Description
+    desc_min_len: int
+    desc_max_len: int
+    desc_html_max_len: "int | None"  # None = marketplace has no separate HTML-length mode
+
+    # Feature bullets (optional field — currently only noon)
+    has_feature_bullets: bool
+    bullet_max_len: int = 250
+
+    # Barcode
+    barcode_min_len: int = 2
+    barcode_max_len: int = 40
+    barcode_forbidden_chars_re: "re.Pattern" = BARCODE_FORBIDDEN_CHARS_TRENDYOL_RE
+
+    # Model code (a field distinct from barcode — currently only Trendyol)
+    has_model_code: bool = True
+
+    # Warranty (optional field — currently only noon)
+    has_warranty_field: bool = False
+    warranty_allowed_keywords: tuple = ("manufactur", "seller", "no warranty", "none", "no_warranty")
+
+    # Images
+    image_min_count: int = 1
+    image_max_count: "int | None" = 8
+    image_url_allowed_extensions: tuple = (".jpg", ".jpeg", ".png", ".webp")
+    image_allowed_pil_formats: tuple = ("JPEG", "PNG", "WEBP")
+    image_min_size_bytes: int = 1024
+    image_max_size_bytes: int = 10 * 1024 * 1024
+    image_min_w: "int | None" = 860
+    image_max_w: "int | None" = 2000
+    image_min_h: "int | None" = 574
+    image_max_h: "int | None" = 2000
+    image_min_aspect_ratio: "float | None" = None  # noon: width/height (or height/width) must be >= this
+    image_min_ppi: "int | None" = None  # noon-specific; best-effort, see verify_images_for_product
+
+    # Category
+    category_min_levels: int = 3
+
+    # Banned-word groups active for this marketplace: list of (label, terms)
+    banned_word_groups: list = field(default_factory=list)
+
+    # Brand-in-title rule wording (differs slightly by marketplace tone)
+    brand_in_title_note: str = "brand shown separately; keep it out of the title"
+
+
+TRENDYOL_CONFIG = MarketplaceConfig(
+    key="trendyol",
+    display_name="Trendyol",
+    rules_doc="Trendyol_MP_QC_Rules.md",
+    title_min_len=3,
+    title_max_len=200,
+    title_length_excludes_brand=True,
+    desc_min_len=0,
+    desc_max_len=4000,
+    desc_html_max_len=30000,
+    has_feature_bullets=False,
+    barcode_min_len=2,
+    barcode_max_len=40,
+    barcode_forbidden_chars_re=BARCODE_FORBIDDEN_CHARS_TRENDYOL_RE,
+    has_model_code=True,
+    has_warranty_field=False,
+    image_min_count=1,
+    image_max_count=8,
+    image_url_allowed_extensions=(".jpg", ".jpeg", ".png", ".webp"),
+    image_allowed_pil_formats=("JPEG", "PNG", "WEBP"),
+    image_min_size_bytes=1024,
+    image_max_size_bytes=10 * 1024 * 1024,
+    image_min_w=860, image_max_w=2000, image_min_h=574, image_max_h=2000,
+    image_min_aspect_ratio=None,
+    image_min_ppi=None,
+    category_min_levels=3,
+    banned_word_groups=[
+        ("unauthorized/unsubstantiated health claim", HEALTH_CLAIM_TERMS),
+        ("off-platform link/contact reference", OFF_PLATFORM_KEYWORDS),
+        ("price/shipping/promo language", PRICE_SHIPPING_PROMO_TERMS),
+    ],
+    brand_in_title_note="Trendyol shows brand separately; keep it out of the title",
+)
+
+NOON_CONFIG = MarketplaceConfig(
+    key="noon",
+    display_name="noon",
+    rules_doc="Noon_MP_QC_Rules.md",
+    title_min_len=20,
+    title_max_len=200,
+    title_length_excludes_brand=False,
+    desc_min_len=250,
+    desc_max_len=4000,
+    desc_html_max_len=None,
+    has_feature_bullets=True,
+    bullet_max_len=250,
+    barcode_min_len=1,
+    barcode_max_len=16,
+    barcode_forbidden_chars_re=BARCODE_FORBIDDEN_CHARS_NOON_RE,
+    has_model_code=False,
+    has_warranty_field=True,
+    warranty_allowed_keywords=("manufactur", "seller", "no warranty", "none", "no_warranty"),
+    image_min_count=1,
+    image_max_count=None,
+    image_url_allowed_extensions=(".jpg", ".jpeg"),
+    image_allowed_pil_formats=("JPEG",),
+    image_min_size_bytes=1024,
+    image_max_size_bytes=10 * 1024 * 1024,
+    image_min_w=660, image_max_w=None, image_min_h=None, image_max_h=None,
+    image_min_aspect_ratio=0.5,
+    image_min_ppi=72,
+    category_min_levels=3,
+    banned_word_groups=[
+        ("prohibited product", NOON_PROHIBITED_PRODUCT_TERMS),
+        ("off-platform link/contact reference", OFF_PLATFORM_KEYWORDS),
+        ("price/shipping/promo language", PRICE_SHIPPING_PROMO_TERMS),
+        ("competitor-marketplace mention", COMPETITOR_MENTION_TERMS),
+    ],
+    brand_in_title_note="noon requires brand to be excluded from the title entirely",
+)
+
+MARKETPLACES = {
+    "trendyol": TRENDYOL_CONFIG,
+    "noon": NOON_CONFIG,
+}
+
+
+def get_marketplace_config(key):
+    try:
+        return MARKETPLACES[key]
+    except KeyError:
+        raise ValueError(f"Unknown marketplace '{key}'. Choose one of: {', '.join(MARKETPLACES)}")
+
+
+# ---------------------------------------------------------------------------
+# Rule catalogue — built per marketplace so thresholds shown match the
+# active config, and so a marketplace only lists rules that actually apply
+# to it (e.g. model_code_format only for Trendyol; feature_bullet_length
+# and warranty_type_check only for noon).
+# ---------------------------------------------------------------------------
+def build_rule_catalogue(cfg):
+    catalogue = [
+        ("title_length", "Title length", HARD, cfg.rules_doc,
+         f"Title {cfg.title_min_len}-{cfg.title_max_len} chars"
+         + (" excluding brand name" if cfg.title_length_excludes_brand else "")
+         + "; must be present."),
+        ("description_length", "Description length", HARD, cfg.rules_doc,
+         (f"{cfg.desc_min_len}-{cfg.desc_max_len} chars"
+          + (f" plain text, up to {cfg.desc_html_max_len} chars if HTML" if cfg.desc_html_max_len else ""))),
+        ("barcode_format", "Barcode format", HARD, cfg.rules_doc,
+         f"{cfg.barcode_min_len}-{cfg.barcode_max_len} chars, no forbidden characters; must be present."),
+        ("image_count", "Image count", HARD, cfg.rules_doc,
+         f"At least {cfg.image_min_count} image(s) required"
+         + (f", maximum {cfg.image_max_count}." if cfg.image_max_count else " (no stated maximum).")),
+        ("image_url_format", "Image URL format", HARD, cfg.rules_doc,
+         "https, direct file link, no spaces/parentheses, plausible image extension for this marketplace."),
+        ("image_technical_spec", "Image technical spec (downloaded)", HARD, cfg.rules_doc,
+         "Format/size/resolution per marketplace spec (requires --verify-images)."),
+        ("banned_words", "Banned / restricted content", HARD, cfg.rules_doc,
+         "Prohibited-product, off-platform, and price/promo language in title, description, or feature bullets."),
+        ("price_consistency", "Price presence", HARD, cfg.rules_doc,
+         "Price must be present and parseable (skipped file-wide if not present in export)."),
+        ("category_present", "Category presence", HARD, cfg.rules_doc,
+         "Category must be present and non-trivial."),
+        ("variant_duplicate", "Barcode / SKU duplication", HARD, cfg.rules_doc,
+         "Barcode must not be reused across unrelated SKUs; SKU must be unique."),
+        ("category_depth_heuristic", "Category taxonomy depth (heuristic)", SOFT, cfg.rules_doc,
+         f"Category path should have at least {cfg.category_min_levels} levels — heuristic, not validated against the live category tree."),
+        ("title_source_fallback", "Title sourced from Product Name (fallback)", SOFT, "(derived)",
+         "Title field is blank; Product Name was used as a stand-in for QC purposes."),
+        ("title_quality", "Title quality", SOFT, cfg.rules_doc,
+         "No ALL CAPS, no repeated words, no emoji, not just the category name, brand name excluded, no excess punctuation."),
+        ("description_quality", "Description quality", SOFT, cfg.rules_doc,
+         "Prefer bullet points on long text; no internal SKU/stock-code leakage; no emoji/caps abuse."),
+        ("duplicate_title", "Duplicate title across SKUs", SOFT, "(derived)",
+         "Same exact title reused for multiple distinct products/barcodes — possible template copy-paste."),
+        ("image_content_heuristic", "Image content quality (heuristic)", SOFT, cfg.rules_doc,
+         "Reused image URL across SKUs (requires --verify-images for background/heuristic checks)."),
+        ("content_relevance", "Category matches product name/title/description", SOFT, cfg.rules_doc,
+         "At least one significant keyword (or known synonym) from the category should appear in Product Name, Title, or Description."),
+        ("title_description_relevance", "Title matches description", SOFT, "(derived)",
+         "Title and Description should share at least one significant keyword."),
+    ]
+    if cfg.has_model_code:
+        catalogue.insert(3, ("model_code_format", "Model code format", HARD, cfg.rules_doc,
+                              "1-40 chars, no URL/email; must be present."))
+    if cfg.has_feature_bullets:
+        catalogue.append(("feature_bullet_length", "Feature bullet length", HARD, cfg.rules_doc,
+                           f"Each feature bullet at most {cfg.bullet_max_len} characters (optional field — informational if entirely absent from the export)."))
+    if cfg.has_warranty_field:
+        catalogue.append(("warranty_type_check", "Warranty type classification", SOFT, cfg.rules_doc,
+                           "Warranty value should clearly map to manufacturer/seller/no-warranty (optional field — informational if entirely absent from the export)."))
+    return catalogue
 
 
 # ---------------------------------------------------------------------------
@@ -191,55 +404,98 @@ def load_products(csv_path):
 # ---------------------------------------------------------------------------
 # Per-product HARD rule checks. Each returns a list of (rule_id, ok, message)
 # ---------------------------------------------------------------------------
-def check_title_length(p):
+def check_title_length(p, cfg):
     title, brand = p["title"], p["brand"]
     if not title:
-        return [("title_length", False, "Missing title (both Title [EN]/Marketing and Product Name are empty).")]
-    effective = re.sub(re.escape(brand), "", title, flags=re.I).strip() if brand else title
+        return [("title_length", False, "Missing title (both the marketing title field and Product Name are empty).")]
+    if cfg.title_length_excludes_brand and brand:
+        effective = re.sub(re.escape(brand), "", title, flags=re.I).strip()
+    else:
+        effective = title
     length = len(effective)
-    if length < 3:
-        return [("title_length", False, f"Title too short: {length} chars excluding brand (min 3).")]
-    if length > 200:
-        return [("title_length", False, f"Title too long: {length} chars excluding brand (max 200).")]
+    excl = " excluding brand" if cfg.title_length_excludes_brand else ""
+    if length < cfg.title_min_len:
+        return [("title_length", False, f"Title too short: {length} chars{excl} (min {cfg.title_min_len}).")]
+    if length > cfg.title_max_len:
+        return [("title_length", False, f"Title too long: {length} chars{excl} (max {cfg.title_max_len}).")]
     return [("title_length", True, "")]
 
 
-def check_description_length(p):
+def check_description_length(p, cfg):
     desc = p["description"]
     if not desc:
-        return [("description_length", False, "Missing description.")]
-    is_html = bool(HTML_TAG_RE.search(desc))
-    limit = 30000 if is_html else 4000
+        if cfg.desc_min_len > 0:
+            return [("description_length", False, "Missing description.")]
+        return [("description_length", True, "")]
+    is_html = bool(cfg.desc_html_max_len) and bool(HTML_TAG_RE.search(desc))
+    limit = cfg.desc_html_max_len if is_html else cfg.desc_max_len
     if len(desc) > limit:
         kind = "HTML" if is_html else "plain text"
         return [("description_length", False, f"Description is {len(desc)} chars, exceeds {limit}-char {kind} limit.")]
+    if len(desc) < cfg.desc_min_len:
+        return [("description_length", False, f"Description is {len(desc)} chars, below the {cfg.desc_min_len}-char minimum.")]
     return [("description_length", True, "")]
 
 
-def check_barcode_format(p):
+def check_feature_bullets(p, cfg, feature_bullets_data_present):
+    if not cfg.has_feature_bullets:
+        return []
+    bullets_text = p.get("feature_bullets", "")
+    if not feature_bullets_data_present:
+        return [("feature_bullet_length", None,
+                 "Feature bullets are not populated anywhere in this export — likely a field this Trustana "
+                 "export doesn't map (Description may be doing double duty), rather than a per-product error.")]
+    if not bullets_text:
+        return [("feature_bullet_length", True, "")]
+    bullets = [b.strip() for b in re.split(r"[\n;]", bullets_text) if b.strip()]
+    too_long = [b for b in bullets if len(b) > cfg.bullet_max_len]
+    if too_long:
+        return [("feature_bullet_length", False,
+                 f"{len(too_long)} of {len(bullets)} feature bullet(s) exceed {cfg.bullet_max_len} characters.")]
+    return [("feature_bullet_length", True, "")]
+
+
+def check_warranty_type(p, cfg, warranty_data_present):
+    if not cfg.has_warranty_field:
+        return []
+    value = p.get("warranty_type", "")
+    if not warranty_data_present:
+        return [("warranty_type_check", None,
+                 "Warranty Type is not populated anywhere in this export — confirm with the source system "
+                 "whether warranty classification is tracked elsewhere before treating as a gap.")]
+    if not value:
+        return [("warranty_type_check", False, "Missing warranty type classification.")]
+    low = value.lower()
+    if not any(kw in low for kw in cfg.warranty_allowed_keywords):
+        return [("warranty_type_check", False,
+                 f"Warranty value '{value}' doesn't clearly map to manufacturer/seller/no-warranty — "
+                 f"verify against noon's bulk-template enum before uploading.")]
+    return [("warranty_type_check", True, "")]
+
+
+def check_barcode_format(p, cfg):
     bc = p["barcode"]
     if not bc:
         return [("barcode_format", False, "Missing barcode/EAN.")]
     issues = []
-    if not (2 <= len(bc) <= 40):
-        issues.append(f"Barcode length {len(bc)} outside 2-40 char range.")
-    if BARCODE_FORBIDDEN_CHARS_RE.search(bc):
-        issues.append("Barcode contains a forbidden character (one of ?/&%+^'*_).")
+    if not (cfg.barcode_min_len <= len(bc) <= cfg.barcode_max_len):
+        issues.append(f"Barcode length {len(bc)} outside {cfg.barcode_min_len}-{cfg.barcode_max_len} char range.")
+    if cfg.barcode_forbidden_chars_re.search(bc):
+        issues.append("Barcode contains a forbidden character or space.")
     if issues:
         return [("barcode_format", False, " ".join(issues))]
     return [("barcode_format", True, "")]
 
 
-def check_model_code(p, model_code_data_present):
+def check_model_code(p, cfg, model_code_data_present):
+    if not cfg.has_model_code:
+        return []
     mc = p["model_code"]
     if not model_code_data_present:
-        # The whole export has this column empty — almost certainly a field
-        # this Trustana export doesn't populate/map, not 151 individual
-        # seller errors. Flag once at the file level instead of per-row.
         return [("model_code_format", None,
                  "Model code (Product Model) is not populated anywhere in this export — likely a field this "
                  "Trustana export doesn't map, rather than a per-product error. Confirm with the source system "
-                 "before treating as a QC gap; Trendyol requires it at upload time.")]
+                 f"before treating as a QC gap; {cfg.display_name} requires it at upload time.")]
     if not mc:
         return [("model_code_format", False, "Missing model code (Product Model column empty).")]
     issues = []
@@ -252,13 +508,13 @@ def check_model_code(p, model_code_data_present):
     return [("model_code_format", True, "")]
 
 
-def check_image_count_and_url_format(p):
+def check_image_count_and_url_format(p, cfg):
     imgs = p["images_list"]
     results = []
     if len(imgs) == 0:
         results.append(("image_count", False, "No images found."))
-    elif len(imgs) > 8:
-        results.append(("image_count", False, f"{len(imgs)} images exceeds the 8-image limit."))
+    elif cfg.image_max_count and len(imgs) > cfg.image_max_count:
+        results.append(("image_count", False, f"{len(imgs)} images exceeds the {cfg.image_max_count}-image limit."))
     else:
         results.append(("image_count", True, ""))
 
@@ -269,8 +525,8 @@ def check_image_count_and_url_format(p):
             problems.append("not https")
         if " " in u or "(" in u or ")" in u:
             problems.append("contains space/parenthesis")
-        if not u.lower().split("?")[0].endswith(ALLOWED_IMAGE_EXTENSIONS):
-            problems.append("no recognizable image extension (jpg/jpeg/png/webp)")
+        if not u.lower().split("?")[0].endswith(cfg.image_url_allowed_extensions):
+            problems.append(f"no recognizable image extension ({'/'.join(e.lstrip('.') for e in cfg.image_url_allowed_extensions)})")
         if problems:
             bad_urls.append(f"{u} ({', '.join(problems)})")
     if bad_urls:
@@ -299,56 +555,53 @@ def check_category_present(p):
     return [("category_present", True, "")]
 
 
-def check_category_depth_heuristic(p):
+def check_category_depth_heuristic(p, cfg):
     cat = p["category"]
     if not cat:
         return []  # already hard-flagged by check_category_present
     parts = [x.strip() for x in cat.split("/") if x.strip()]
-    if len(parts) < 3:
+    if len(parts) < cfg.category_min_levels:
         return [("category_depth_heuristic", False,
-                  f"Category path has only {len(parts)} level(s) ({cat}) — may not be a leaf node. "
-                  f"Verify against Trendyol's live category tree (not available in this export).")]
+                  f"Category path has only {len(parts)} level(s) ({cat}) — {cfg.display_name} expects at least "
+                  f"{cfg.category_min_levels}. Verify against {cfg.display_name}'s live category tree (not available in this export).")]
     return [("category_depth_heuristic", True, "")]
 
 
-TEXT_FIELDS_FOR_BANNED_WORDS = ["title", "description"]
+TEXT_FIELDS_FOR_BANNED_WORDS = ["title", "description", "feature_bullets"]
 
 
-def check_banned_words(p):
+def check_banned_words(p, cfg):
     findings = []
-    for field in TEXT_FIELDS_FOR_BANNED_WORDS:
-        text = p.get(field, "")
+    for field_name in TEXT_FIELDS_FOR_BANNED_WORDS:
+        text = p.get(field_name, "")
         if not text:
             continue
         low = text.lower()
-        for term in HEALTH_CLAIM_TERMS:
-            if term in low:
-                findings.append(f"possible unauthorized/unsubstantiated health claim '{term}' in {field}")
-        for kw in OFF_PLATFORM_KEYWORDS:
-            if kw in low:
-                findings.append(f"off-platform link/contact reference '{kw}' in {field}")
-        for term in PRICE_SHIPPING_PROMO_TERMS:
-            if term in low:
-                findings.append(f"price/shipping/promo language '{term}' in {field}")
+        for label, terms in cfg.banned_word_groups:
+            for term in terms:
+                if term in low:
+                    findings.append(f"possible {label} '{term}' in {field_name}")
         if EMAIL_RE.search(text):
-            findings.append(f"email address detected in {field}")
+            findings.append(f"email address detected in {field_name}")
         if PHONE_LIKE_RE.search(text) or LONG_DIGIT_RUN_RE.search(text):
-            findings.append(f"phone-number-like digit sequence detected in {field}")
+            findings.append(f"phone-number-like digit sequence detected in {field_name}")
     if findings:
         return [("banned_words", False, "; ".join(findings))]
     return [("banned_words", True, "")]
 
 
-def run_hard_checks(p, price_data_present, model_code_data_present):
+def run_hard_checks(p, cfg, price_data_present, model_code_data_present,
+                     feature_bullets_data_present, warranty_data_present):
     results = []
-    results += check_title_length(p)
-    results += check_description_length(p)
-    results += check_barcode_format(p)
-    results += check_model_code(p, model_code_data_present)
-    results += check_image_count_and_url_format(p)
+    results += check_title_length(p, cfg)
+    results += check_description_length(p, cfg)
+    results += check_barcode_format(p, cfg)
+    results += check_model_code(p, cfg, model_code_data_present)
+    results += check_feature_bullets(p, cfg, feature_bullets_data_present)
+    results += check_image_count_and_url_format(p, cfg)
     results += check_price_consistency(p, price_data_present)
     results += check_category_present(p)
-    results += check_banned_words(p)
+    results += check_banned_words(p, cfg)
     return results
 
 
@@ -358,13 +611,13 @@ def run_hard_checks(p, price_data_present, model_code_data_present):
 def check_title_source(p):
     if p.get("title_source") == "Product Name (fallback)":
         return [("title_source_fallback", False,
-                  f"Title [EN]/Marketing is blank — used Product Name ('{p['title']}') as a stand-in for QC purposes. "
-                  f"Product Name often carries brand/size/internal-code text not meant for a marketplace title — "
-                  f"populate a proper Title [EN]/Marketing value rather than relying on this fallback.")]
+                  f"The marketing title field is blank — used Product Name ('{p['title']}') as a stand-in for QC "
+                  f"purposes. Product Name often carries brand/size/internal-code text not meant for a "
+                  f"marketplace title — populate a proper marketing title rather than relying on this fallback.")]
     return [("title_source_fallback", True, "")]
 
 
-def check_title_quality(p):
+def check_title_quality(p, cfg):
     title, brand, cat = p["title"], p["brand"], p["category"]
     if not title:
         return []
@@ -384,14 +637,14 @@ def check_title_quality(p):
     if leaf and title.strip().lower() == leaf:
         issues.append("title is just the category name")
     if brand and re.search(re.escape(brand), title, re.I):
-        issues.append(f"title contains brand name '{brand}' (Trendyol shows brand separately; keep it out of the title)")
+        issues.append(f"title contains brand name '{brand}' ({cfg.brand_in_title_note})")
     if title.count("!") > 1 or title.count("?") > 1:
         issues.append("excessive punctuation in title")
     last_token = title.strip().split()[-1] if title.strip() else ""
     stripped_token = re.sub(r"[^A-Za-z0-9]", "", last_token)
     if (len(stripped_token) >= 6 and stripped_token.isupper()
             and any(c.isdigit() for c in stripped_token) and any(c.isalpha() for c in stripped_token)):
-        issues.append(f"title ends with a letters+digits code ('{last_token}') — likely a manufacturer model number or internal stock code carried over from Product Name; Trendyol prohibits stock info in the title, so confirm this is meant to be customer-facing before keeping it")
+        issues.append(f"title ends with a letters+digits code ('{last_token}') — likely a manufacturer model number or internal stock code carried over from Product Name; confirm this is meant to be customer-facing before keeping it")
     if issues:
         return [("title_quality", False, "; ".join(issues))]
     return [("title_quality", True, "")]
@@ -527,11 +780,11 @@ def compute_content_detail(p):
 
 
 def check_content_relevance(p, detail=None):
-    """Does the assigned Trendyol category actually match what the product
-    *is*, per its own name/title/description? Deliberately checks
-    Product Name in addition to Title, since Title may be the Product Name
-    fallback anyway, and Product Name sometimes carries more specific
-    type wording than a cleaned-up marketing title."""
+    """Does the assigned category actually match what the product *is*, per
+    its own name/title/description? Deliberately checks Product Name in
+    addition to Title, since Title may be the Product Name fallback anyway,
+    and Product Name sometimes carries more specific type wording than a
+    cleaned-up marketing title."""
     cat, title, desc, name = p["category"], p["title"], p["description"], p["product_name"]
     if not cat or not (title or desc or name):
         return []
@@ -567,15 +820,16 @@ def check_title_description_relevance(p, detail=None):
     return [("title_description_relevance", True, "")]
 
 
-def run_soft_checks(p):
+def run_soft_checks(p, cfg, warranty_data_present):
     detail = compute_content_detail(p)
     results = []
     results += check_title_source(p)
-    results += check_title_quality(p)
+    results += check_title_quality(p, cfg)
     results += check_description_quality(p)
     results += check_content_relevance(p, detail=detail)
     results += check_title_description_relevance(p, detail=detail)
-    results += check_category_depth_heuristic(p)
+    results += check_category_depth_heuristic(p, cfg)
+    results += check_warranty_type(p, cfg, warranty_data_present)
     return results
 
 
@@ -645,7 +899,7 @@ def run_cross_product_checks(products):
 # ---------------------------------------------------------------------------
 # Optional: real image download verification
 # ---------------------------------------------------------------------------
-def verify_images_for_product(p, session, max_checks_remaining, network_ok):
+def verify_images_for_product(p, cfg, session, max_checks_remaining, network_ok):
     """Returns (results, network_ok, checks_used). results is a list of
     (rule_id, ok/None, message)."""
     if not network_ok or max_checks_remaining <= 0 or not p["images_list"]:
@@ -669,20 +923,41 @@ def verify_images_for_product(p, session, max_checks_remaining, network_ok):
             size = len(content)
             fmt = None
             w = h = None
+            dpi = None
             try:
                 img = Image.open(io.BytesIO(content))
                 fmt = img.format
                 w, h = img.size
+                dpi_info = img.info.get("dpi")
+                if dpi_info:
+                    dpi = min(dpi_info)
             except Exception:
                 pass
 
             problems = []
-            if fmt not in ("JPEG", "PNG", "WEBP"):
-                problems.append(f"format {fmt or 'unknown'} not in JPEG/PNG/WEBP")
-            if not (1024 <= size <= 10 * 1024 * 1024):
-                problems.append(f"file size {size} bytes outside 1KB-10MB")
-            if w and h and not (860 <= w <= 2000 and 574 <= h <= 2000):
-                problems.append(f"resolution {w}x{h} outside 860x574-2000x2000")
+            if cfg.image_allowed_pil_formats and fmt not in cfg.image_allowed_pil_formats:
+                problems.append(f"format {fmt or 'unknown'} not in {'/'.join(cfg.image_allowed_pil_formats)}")
+            if not (cfg.image_min_size_bytes <= size <= cfg.image_max_size_bytes):
+                problems.append(f"file size {size} bytes outside {cfg.image_min_size_bytes}-{cfg.image_max_size_bytes} bytes")
+            if w and h:
+                if cfg.image_min_w and w < cfg.image_min_w:
+                    problems.append(f"width {w}px below minimum {cfg.image_min_w}px")
+                if cfg.image_max_w and w > cfg.image_max_w:
+                    problems.append(f"width {w}px above maximum {cfg.image_max_w}px")
+                if cfg.image_min_h and h < cfg.image_min_h:
+                    problems.append(f"height {h}px below minimum {cfg.image_min_h}px")
+                if cfg.image_max_h and h > cfg.image_max_h:
+                    problems.append(f"height {h}px above maximum {cfg.image_max_h}px")
+                if cfg.image_min_aspect_ratio:
+                    ratio = min(w, h) / max(w, h)
+                    if ratio < cfg.image_min_aspect_ratio:
+                        problems.append(f"aspect ratio {ratio:.2f} below minimum {cfg.image_min_aspect_ratio}")
+            # PPI/DPI metadata is frequently absent even on perfectly good web
+            # images — only flag when the metadata IS present and too low,
+            # never penalize for missing metadata (that would be a false
+            # positive on the majority of ordinary web-optimized images).
+            if cfg.image_min_ppi and dpi is not None and dpi < cfg.image_min_ppi:
+                problems.append(f"resolution {dpi} PPI below minimum {cfg.image_min_ppi} PPI")
             if problems:
                 results.append(("image_technical_spec", False, f"{u}: " + "; ".join(problems)))
             else:
@@ -704,18 +979,26 @@ def verify_images_for_product(p, session, max_checks_remaining, network_ok):
 # ---------------------------------------------------------------------------
 # Main QC run
 # ---------------------------------------------------------------------------
-def run_qc(csv_path, verify_images=False, max_image_checks=500):
+def run_qc(csv_path, marketplace="trendyol", verify_images=False, max_image_checks=500):
+    cfg = get_marketplace_config(marketplace)
+    rule_catalogue = build_rule_catalogue(cfg)
+    rule_severity = {r[0]: r[2] for r in rule_catalogue}
+    rule_name = {r[0]: r[1] for r in rule_catalogue}
+
     products = load_products(csv_path)
 
     price_data_present = any(p["price"] or p["stock"] for p in products)
-    model_code_data_present = any(p["model_code"] for p in products)
+    model_code_data_present = any(p["model_code"] for p in products) if cfg.has_model_code else False
+    feature_bullets_data_present = any(p.get("feature_bullets") for p in products) if cfg.has_feature_bullets else False
+    warranty_data_present = any(p.get("warranty_type") for p in products) if cfg.has_warranty_field else False
 
-    all_issues = []  # (sku, product_name, title, brand, category, rule_id, severity, ok, message)
+    all_issues = []
     per_product_results = defaultdict(list)  # sku -> list of (rule_id, ok, message)
 
     for p in products:
-        hard_results = run_hard_checks(p, price_data_present, model_code_data_present)
-        soft_results = run_soft_checks(p)
+        hard_results = run_hard_checks(p, cfg, price_data_present, model_code_data_present,
+                                        feature_bullets_data_present, warranty_data_present)
+        soft_results = run_soft_checks(p, cfg, warranty_data_present)
         for rule_id, ok, msg in hard_results + soft_results:
             per_product_results[p["sku"]].append((rule_id, ok, msg))
 
@@ -742,13 +1025,11 @@ def run_qc(csv_path, verify_images=False, max_image_checks=500):
                 if not network_ok or image_checks_remaining <= 0:
                     break
                 processed_skus.add(p["sku"])
-                results, network_ok, used = verify_images_for_product(p, session, image_checks_remaining, network_ok)
+                results, network_ok, used = verify_images_for_product(p, cfg, session, image_checks_remaining, network_ok)
                 image_checks_remaining -= used
                 for rule_id, ok, msg in results:
                     per_product_results[p["sku"]].append((rule_id, ok, msg))
             if not network_ok:
-                # Make the skip explicit for every product that never got a
-                # chance to be checked, so the report doesn't silently under-count.
                 for p in products:
                     if p["sku"] not in processed_skus:
                         per_product_results[p["sku"]].append((
@@ -757,8 +1038,6 @@ def run_qc(csv_path, verify_images=False, max_image_checks=500):
                             "after an earlier download failure (see Summary sheet)."
                         ))
 
-    # Flatten into issues list (only non-pass entries, i.e. ok is False; None
-    # entries are informational/skipped and get their own bucket)
     info_notes = []
     for p in products:
         for rule_id, ok, msg in per_product_results[p["sku"]]:
@@ -766,8 +1045,8 @@ def run_qc(csv_path, verify_images=False, max_image_checks=500):
                 all_issues.append({
                     "sku": p["sku"], "product_name": p["product_name"], "title": p["title"],
                     "brand": p["brand"], "category": p["category"],
-                    "rule_id": rule_id, "rule_name": RULE_NAME.get(rule_id, rule_id),
-                    "severity": RULE_SEVERITY.get(rule_id, "SOFT"), "message": msg,
+                    "rule_id": rule_id, "rule_name": rule_name.get(rule_id, rule_id),
+                    "severity": rule_severity.get(rule_id, "SOFT"), "message": msg,
                 })
             elif ok is None and msg:
                 info_notes.append({
@@ -775,12 +1054,17 @@ def run_qc(csv_path, verify_images=False, max_image_checks=500):
                 })
 
     return {
+        "marketplace": cfg.key,
+        "marketplace_display_name": cfg.display_name,
+        "rule_catalogue": rule_catalogue,
         "products": products,
         "per_product_results": per_product_results,
         "issues": all_issues,
         "info_notes": info_notes,
         "price_data_present": price_data_present,
         "model_code_data_present": model_code_data_present,
+        "feature_bullets_data_present": feature_bullets_data_present,
+        "warranty_data_present": warranty_data_present,
         "verify_images_requested": verify_images,
         "image_network_ok": network_ok if verify_images else None,
     }
@@ -812,14 +1096,18 @@ def build_report(qc_result, output_path, source_file):
     products = qc_result["products"]
     issues = qc_result["issues"]
     per_product = qc_result["per_product_results"]
+    rule_catalogue = qc_result["rule_catalogue"]
+    rule_name = {r[0]: r[1] for r in rule_catalogue}
+    marketplace_name = qc_result["marketplace_display_name"]
 
     wb = Workbook()
 
     # --- Summary sheet ---
     ws = wb.active
     ws.title = "Summary"
-    ws.append(["Trendyol Marketplace QC Report"])
+    ws.append([f"{marketplace_name} Marketplace QC Report"])
     ws["A1"].font = Font(bold=True, size=14)
+    ws.append([f"Marketplace: {marketplace_name}"])
     ws.append([f"Source file: {source_file}"])
     ws.append([f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"])
     ws.append([f"Total products checked: {len(products)}"])
@@ -832,8 +1120,12 @@ def build_report(qc_result, output_path, source_file):
     ws.append([f"Products with zero issues found: {sum(1 for p in products if not any(i['sku']==p['sku'] for i in issues))}"])
     if not qc_result["price_data_present"]:
         ws.append(["NOTE: Price/Stock columns are empty in this export — price_consistency was skipped for all products."])
-    if not qc_result["model_code_data_present"]:
+    if not qc_result["model_code_data_present"] and qc_result.get("marketplace") == "trendyol":
         ws.append(["NOTE: Product Model (model code) column is empty for every product in this export — model_code_format was flagged as informational rather than a per-product fail. Confirm with the source system whether this field is mapped elsewhere."])
+    if qc_result.get("marketplace") == "noon" and not qc_result.get("feature_bullets_data_present"):
+        ws.append(["NOTE: Feature bullets are not populated anywhere in this export — feature_bullet_length was flagged as informational rather than a per-product fail."])
+    if qc_result.get("marketplace") == "noon" and not qc_result.get("warranty_data_present"):
+        ws.append(["NOTE: Warranty Type is not populated anywhere in this export — warranty_type_check was flagged as informational rather than a per-product fail."])
     if qc_result["verify_images_requested"]:
         if qc_result["image_network_ok"]:
             ws.append(["Image technical verification: images were downloaded and checked against format/size/resolution spec."])
@@ -843,10 +1135,10 @@ def build_report(qc_result, output_path, source_file):
 
     ws.append(["Rule", "Severity", "Products failing", "Products passing", "Not evaluated / N/A"])
     header_row = ws.max_row
-    rule_ids_in_order = [r[0] for r in RULE_CATALOGUE]
+    rule_ids_in_order = [r[0] for r in rule_catalogue]
     for rule_id in rule_ids_in_order:
-        name = RULE_NAME[rule_id]
-        sev = RULE_SEVERITY[rule_id]
+        name = rule_name[rule_id]
+        sev = {r[0]: r[2] for r in rule_catalogue}[rule_id]
         fail = sum(1 for i in issues if i["rule_id"] == rule_id)
         pass_ct = 0
         na_ct = 0
@@ -960,33 +1252,38 @@ def build_report(qc_result, output_path, source_file):
 
     # --- Rules Reference sheet ---
     ws4 = wb.create_sheet("Rules Reference")
+    ws4.append([f"Rules for: {marketplace_name}"])
+    ws4["A1"].font = Font(bold=True, size=12)
+    ws4.append([])
     ws4.append(["Rule ID", "Name", "Severity", "Source section(s)", "Condition"])
-    _style_header(ws4)
-    for rule_id, name, sev, source, cond in RULE_CATALOGUE:
+    header_row4 = ws4.max_row
+    for rule_id, name, sev, source, cond in rule_catalogue:
         ws4.append([rule_id, name, sev, source, cond])
-    for row in ws4.iter_rows(min_row=2, max_row=ws4.max_row):
+    _style_header(ws4, row=header_row4)
+    for row in ws4.iter_rows(min_row=header_row4 + 1, max_row=ws4.max_row):
         fill = HARD_FILL if row[2].value == HARD else SOFT_FILL
         for cell in row:
             cell.fill = fill
-    ws4.freeze_panes = "A2"
+    ws4.freeze_panes = f"A{header_row4 + 1}"
     _autosize(ws4, [24, 34, 10, 18, 80])
 
     wb.save(output_path)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Trendyol Marketplace QC tool for Trustana product exports.")
+    parser = argparse.ArgumentParser(description="Trustana AI Content Verifier for MP — checks a Trustana export against a marketplace's listing rules.")
     parser.add_argument("csv_path", help="Path to the Trustana product export CSV")
     parser.add_argument("output_path", help="Path to write the Excel QC report")
+    parser.add_argument("--marketplace", required=True, choices=list(MARKETPLACES.keys()), help="Which marketplace's rules to check against")
     parser.add_argument("--verify-images", action="store_true", help="Download images and verify format/size/resolution")
     parser.add_argument("--max-image-checks", type=int, default=500, help="Cap on number of images to download when --verify-images is set")
     args = parser.parse_args()
 
-    qc_result = run_qc(args.csv_path, verify_images=args.verify_images, max_image_checks=args.max_image_checks)
+    qc_result = run_qc(args.csv_path, marketplace=args.marketplace, verify_images=args.verify_images, max_image_checks=args.max_image_checks)
     build_report(qc_result, args.output_path, args.csv_path)
     n_hard = sum(1 for i in qc_result["issues"] if i["severity"] == HARD)
     n_soft = sum(1 for i in qc_result["issues"] if i["severity"] == SOFT)
-    print(f"Checked {len(qc_result['products'])} products: {n_hard} hard issues, {n_soft} soft flags.")
+    print(f"[{qc_result['marketplace_display_name']}] Checked {len(qc_result['products'])} products: {n_hard} hard issues, {n_soft} soft flags.")
     print(f"Report written to {args.output_path}")
 
 
