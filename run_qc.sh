@@ -3,17 +3,35 @@
 #
 # Usage:
 #   ./run_qc.sh <trustana_export.csv> [trendyol|noon] [--verify-images]
+#                                      [--export-template OUTPUT_XLSX]
+#                                      [--template-file CURRENT_TEMPLATE_XLSX] [--allow-soft-issues]
 #
 # Marketplace defaults to "trendyol" if omitted. The report is saved next to
 # the input file as <name>_<marketplace>_QC_Report.xlsx. First run sets up a
 # local Python environment automatically (one-time, ~30 seconds); every run
 # after that is instant.
+#
+# --export-template OUTPUT_XLSX     Also fill the marketplace's own upload
+#                                    template with every QC-clean product.
+# --template-file CURRENT_TEMPLATE  The upload template to fill — download the
+#                                    current one from the marketplace's seller
+#                                    center first (Trendyol's varies by which
+#                                    categories you requested it for). Omit to
+#                                    fall back to the bundled copy (may be stale).
+# --allow-soft-issues                Relax "QC-clean" for --export-template from
+#                                    zero issues to zero rejection-risk (HARD)
+#                                    issues. See README's "Stage 2" section.
+#
+# Examples:
+#   ./run_qc.sh Products_export.csv noon --export-template noon_upload.xlsx --template-file current_noon_template.xlsx
+#   ./run_qc.sh Products_export.csv trendyol --export-template trendyol_upload.xlsx --template-file current_trendyol_template.xlsx --allow-soft-issues
 
 set -e
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 if [ -z "$1" ]; then
   echo "Usage: ./run_qc.sh <trustana_export.csv> [trendyol|noon] [--verify-images]"
+  echo "                                          [--export-template OUTPUT_XLSX] [--allow-soft-issues]"
   echo "Marketplace defaults to 'trendyol' if omitted."
   echo "The report will be saved next to the input file as <name>_<marketplace>_QC_Report.xlsx"
   exit 1

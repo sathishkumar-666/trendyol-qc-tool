@@ -15,6 +15,14 @@ minutes.
   each marketplace's checks are built from. Not imported by code, but keep
   them in the repo so the "Rules Reference" sheet's source citations make
   sense to whoever reads the report.
+- `noon_template.xlsx` / `trendyol_template.xlsx` — the actual marketplace
+  upload templates, used for two things: noon's Classification Directory
+  (real category validation) and the Stage 2 "fill the upload template"
+  export for both marketplaces. `qc_engine.py` opens these by filename from
+  this same folder, so they must be pushed to the repo alongside the code —
+  a missing/renamed file doesn't crash the app, it just degrades the
+  affected checks/exports to "unverified"/unavailable with a note in the
+  report, so it's easy to miss if you forget to push them.
 - `requirements.txt` — everything needed, including `streamlit` and
   `pandas`. Streamlit Cloud installs from this automatically.
 - `run_qc.sh` / `run_qc.bat` / the rest of `README.md` — the local
@@ -31,7 +39,7 @@ minutes.
      ```
      cd trendyol_qc_tool
      git init
-     git add app.py qc_engine.py Trendyol_MP_QC_Rules.md Noon_MP_QC_Rules.md requirements.txt README.md run_qc.sh run_qc.bat
+     git add app.py qc_engine.py Trendyol_MP_QC_Rules.md Noon_MP_QC_Rules.md noon_template.xlsx trendyol_template.xlsx requirements.txt README.md DEPLOY.md run_qc.sh run_qc.bat
      git commit -m "Trustana AI Content Verifier for MP"
      git branch -M main
      git remote add origin https://github.com/<your-org>/<your-repo>.git
@@ -66,7 +74,7 @@ same repo/branch it's already watching:
 
 ```
 cd trendyol_qc_tool
-git add app.py qc_engine.py Noon_MP_QC_Rules.md Trendyol_MP_QC_Rules.md README.md DEPLOY.md run_qc.sh run_qc.bat requirements.txt
+git add app.py qc_engine.py Noon_MP_QC_Rules.md Trendyol_MP_QC_Rules.md noon_template.xlsx trendyol_template.xlsx README.md DEPLOY.md run_qc.sh run_qc.bat requirements.txt
 git rm trendyol_qc_tool.py
 git commit -m "Add noon marketplace, marketplace selector, rename to Trustana AI Content Verifier for MP"
 git push
@@ -81,6 +89,20 @@ a marketplace dropdown appears.
 (The `git rm trendyol_qc_tool.py` removes the old single-marketplace engine
 file, which `app.py` no longer imports from — keeping it around would just
 be dead code sitting in the repo.)
+
+**If you're updating a deployment from before the Stage 2/noon-directory
+feature specifically** (i.e. `noon_template.xlsx` and `trendyol_template.xlsx`
+don't exist in your repo yet), make sure those two files are included in
+the `git add` above — they're the two new binary files this feature needs,
+and without them noon's category check falls back to "unverified" and
+Stage 2 export isn't available for either marketplace. Once pushed and
+redeployed, the app gets a new "Stage 2: export to marketplace upload
+template" section below the issues table: click "Generate export summary"
+to see a manual-review breakdown of what would be exported, then upload the
+*current* upload template downloaded from noon's/Trendyol's own seller
+center (not a saved copy — Trendyol's template in particular varies by
+which categories you requested it for) before clicking "Fill template &
+download".
 
 ## If the product data is sensitive
 
