@@ -93,7 +93,10 @@ template so you can submit it directly (see "Stage 2" below).
 - **Issues** — a flat list, one row per problem found: SKU, rule, severity
   (HARD = rejection-risk, SOFT = quality flag), and the specific message.
 - **Products** — one row per product with an overall status
-  (`REJECTION RISK` / `NEEDS REVIEW` / `OK`) and all its issues listed.
+  (`REJECTION RISK` / `NEEDS REVIEW` / `OK`), all its issues listed, and an
+  "Image URLs" column listing every image URL for that product (one per
+  line in the cell) alongside the "# Images" count, so you can open/check
+  the actual images without leaving the report.
 - **Content Checks** — the actual evidence behind the category-match and
   title/description-match checks (which keywords matched, which didn't) so
   you can see *why* something passed or failed, not just that it did.
@@ -338,6 +341,21 @@ redeployed. See `DEPLOY.md` for how the web app is deployed/updated.
   flags as "worth a human look," not a verdict, and treat noon's HARD
   category-validity check as "is this a real category," not "is this the
   *right* category for this specific product."
+- **Duplicate-barcode detection reads the CSV as plain text, with no
+  numeric parsing** — it will never itself introduce a rounding/precision
+  artifact into a barcode value. If your export was ever opened and
+  re-saved in Excel or Google Sheets before reaching this tool, though,
+  *that* step can silently corrupt a long numeric-looking barcode column
+  (spreadsheet software stores numbers as floating point, and a barcode
+  with more digits than that can represent exactly gets rounded, often
+  collapsing several different real barcodes into one that ends in a long
+  run of zeros). When the tool sees a duplicated barcode matching that
+  "long number, many trailing zeros" shape, it adds a note to the
+  Issues-sheet message flagging this possibility — but it still reports the
+  duplicate either way, since some sellers do genuinely reuse an all-zero
+  placeholder barcode on purpose, which is just as real an issue. If you
+  see that note, the fix is to re-export the CSV directly from Trustana
+  without any Excel/Sheets round-trip in between and re-run QC.
 - **Google Category is shown for reference only** (Products sheet), not
   used in any automated pass/fail — testing showed it's a much broader,
   more generic taxonomy than either marketplace's own categories, so

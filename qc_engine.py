@@ -1111,6 +1111,24 @@ def run_soft_checks(p, cfg, warranty_data_present, classification_dir=None):
 # ---------------------------------------------------------------------------
 # Cross-product checks (duplicates)
 # ---------------------------------------------------------------------------
+TRAILING_ZEROS_RE = re.compile(r"0{5,}$")
+
+
+def _looks_like_precision_loss_artifact(barcode):
+    """A long all-numeric barcode ending in 5+ zeros is a classic signature
+    of a spreadsheet round-trip corrupting the value: Excel/Google Sheets
+    auto-detects a long digit string as a number, stores it as a float64,
+    and once the true value needs more than ~15-17 significant digits,
+    the low-order digits silently round to zero on save/re-export — turning
+    several genuinely different long barcodes into the same round-looking
+    number. This is a heuristic, not proof: some sellers do use a real
+    barcode that happens to end in zeros, and some genuine dummy/placeholder
+    barcodes look exactly like this too (e.g. a seller reusing '000...000'
+    intentionally). Used only to add a diagnostic hint to the duplicate-
+    barcode message, not to change whether it's flagged."""
+    return len(barcode) >= 10 and barcode.isdigit() and bool(TRAILING_ZEROS_RE.search(barcode))
+
+
 def run_cross_product_checks(products):
     """Returns dict: sku -> list of (rule_id, severity, message)"""
     extra = defaultdict(list)
@@ -1133,11 +1151,21 @@ def run_cross_product_checks(products):
     for barcode, plist in by_barcode.items():
         if len(plist) > 1:
             skus = ", ".join(sorted(set(x["sku"] for x in plist)))
+            message = f"Barcode '{barcode}' is reused across multiple SKUs ({skus}) — only one barcode is allowed per unique product/variant combination."
+            if _looks_like_precision_loss_artifact(barcode):
+                message += (
+                    " Note: this value is long and ends in an unusually long run of zeros, which is also the classic "
+                    "signature of a spreadsheet precision-loss bug — if this CSV was ever opened and re-saved in Excel "
+                    "or Google Sheets, a long numeric-looking barcode column can get silently rounded to a value like "
+                    "this, making genuinely different barcodes collapse into the same one. This QC tool reads the CSV "
+                    "as plain text and does not do this itself, so if that's what happened here, it happened before "
+                    "this file reached the tool. Verify these SKUs' real barcodes in your source system (Trustana/PIM) "
+                    "and re-export directly from there without an Excel round-trip before re-running QC — but treat "
+                    "this as worth checking, not dismissing outright: some sellers do reuse an all-zero placeholder "
+                    "barcode on purpose, which is just as real an issue."
+                )
             for p in plist:
-                extra[p["sku"]].append((
-                    "variant_duplicate", HARD,
-                    f"Barcode '{barcode}' is reused across multiple SKUs ({skus}) — only one barcode is allowed per unique product/variant combination."
-                ))
+                extra[p["sku"]].append(("variant_duplicate", HARD, message))
 
     for sku, plist in by_sku.items():
         if len(plist) > 1:
@@ -1468,7 +1496,7 @@ def build_report(qc_result, output_path, source_file):
     # --- Products sheet ---
     ws3 = wb.create_sheet("Products")
     headers3 = ["SKU", "Product Name", "Title", "Title Source", "Brand", "Category", "Google Category (reference only)",
-                "Barcode", "# Images", "Hard Fail Count", "Soft Flag Count", "Overall Status", "Hard Issues", "Soft Issues"]
+                "Barcode", "# Images", "Image URLs", "Hard Fail Count", "Soft Flag Count", "Overall Status", "Hard Issues", "Soft Issues"]
     ws3.append(headers3)
     _style_header(ws3)
     for p in products:
@@ -1483,12 +1511,14 @@ def build_report(qc_result, output_path, source_file):
             status = "OK"
         ws3.append([
             p["sku"], p["product_name"], p["title"], p["title_source"], p["brand"], p["category"], p["google_category"],
-            p["barcode"], len(p["images_list"]), len(hard_issues), len(soft_issues), status,
+            p["barcode"], len(p["images_list"]), _xlsx_safe("\n".join(p["images_list"])),
+            len(hard_issues), len(soft_issues), status,
             "; ".join(f"[{i['rule_name']}] {i['message']}" for i in hard_issues),
             "; ".join(f"[{i['rule_name']}] {i['message']}" for i in soft_issues),
         ])
     for row in ws3.iter_rows(min_row=2, max_row=ws3.max_row):
-        status_cell = row[11]
+        row[9].alignment = Alignment(vertical="top", wrap_text=True)
+        status_cell = row[12]
         if status_cell.value == "REJECTION RISK":
             status_cell.fill = HARD_FILL
         elif status_cell.value == "NEEDS REVIEW":
@@ -1497,7 +1527,7 @@ def build_report(qc_result, output_path, source_file):
             status_cell.fill = OK_FILL
     ws3.freeze_panes = "A2"
     ws3.auto_filter.ref = ws3.dimensions
-    _autosize(ws3, [10, 40, 40, 22, 16, 30, 34, 18, 9, 12, 12, 16, 60, 60])
+    _autosize(ws3, [10, 40, 40, 22, 16, 30, 34, 18, 9, 60, 12, 12, 16, 60, 60])
 
     # --- Content Checks sheet: detailed evidence behind the content-relevance
     # checks (category-vs-content, title-vs-description), plus the other
