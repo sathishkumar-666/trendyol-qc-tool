@@ -11,7 +11,7 @@ minutes.
   download report). This is the file Streamlit Cloud runs.
 - `qc_engine.py` — the actual multi-marketplace QC engine. `app.py` imports
   from it directly; don't rename or move it out of this folder.
-- `Trendyol_MP_QC_Rules.md` / `Noon_MP_QC_Rules.md` — the source rules docs
+- `Trendyol_MP_QC_Rules.md` / `Noon_MP_QC_Rules.md` / `Amazon_MP_QC_Rules.md` — the source rules docs
   each marketplace's checks are built from. Not imported by code, but keep
   them in the repo so the "Rules Reference" sheet's source citations make
   sense to whoever reads the report.
@@ -39,7 +39,7 @@ minutes.
      ```
      cd trendyol_qc_tool
      git init
-     git add app.py qc_engine.py Trendyol_MP_QC_Rules.md Noon_MP_QC_Rules.md noon_template.xlsx trendyol_template.xlsx requirements.txt README.md DEPLOY.md run_qc.sh run_qc.bat
+     git add app.py qc_engine.py Trendyol_MP_QC_Rules.md Noon_MP_QC_Rules.md Amazon_MP_QC_Rules.md noon_template.xlsx trendyol_template.xlsx requirements.txt README.md DEPLOY.md run_qc.sh run_qc.bat
      git commit -m "Trustana AI Content Verifier for MP"
      git branch -M main
      git remote add origin https://github.com/<your-org>/<your-repo>.git
@@ -74,7 +74,7 @@ same repo/branch it's already watching:
 
 ```
 cd trendyol_qc_tool
-git add app.py qc_engine.py Noon_MP_QC_Rules.md Trendyol_MP_QC_Rules.md noon_template.xlsx trendyol_template.xlsx README.md DEPLOY.md run_qc.sh run_qc.bat requirements.txt
+git add app.py qc_engine.py Noon_MP_QC_Rules.md Trendyol_MP_QC_Rules.md Amazon_MP_QC_Rules.md noon_template.xlsx trendyol_template.xlsx README.md DEPLOY.md run_qc.sh run_qc.bat requirements.txt
 git rm trendyol_qc_tool.py
 git commit -m "Add noon marketplace, marketplace selector, rename to Trustana AI Content Verifier for MP"
 git push

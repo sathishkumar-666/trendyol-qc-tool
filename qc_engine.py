@@ -7,9 +7,10 @@ rules and produces an Excel QC report. Currently supports:
 
     - trendyol  (see Trendyol_MP_QC_Rules.md)
     - noon      (see Noon_MP_QC_Rules.md)
+    - amazon    (Amazon.sa; see Amazon_MP_QC_Rules.md)
 
 Usage:
-    python3 qc_engine.py <trustana_export.csv> <output_report.xlsx> --marketplace trendyol|noon [--verify-images] [--max-image-checks N]
+    python3 qc_engine.py <trustana_export.csv> <output_report.xlsx> --marketplace trendyol|noon|amazon [--verify-images] [--max-image-checks N]
 
     --marketplace          Which marketplace's rules to check against.
                            Required.
@@ -43,6 +44,8 @@ import csv
 import re
 import io
 import argparse
+import base64
+import urllib.parse
 from pathlib import Path
 from dataclasses import dataclass, field
 from collections import defaultdict, Counter
@@ -215,6 +218,22 @@ NOON_PROHIBITED_PRODUCT_TERMS = [
 BARCODE_FORBIDDEN_CHARS_TRENDYOL_RE = re.compile(r"[?/&%+^'*_]")
 BARCODE_FORBIDDEN_CHARS_NOON_RE = re.compile(r"[+/\-%&\s]")
 
+# Amazon.sa: no Trustana export shaped specifically for Amazon has been
+# seen yet, so each text field lists the header names it is likely to use —
+# load_products() takes the first candidate that actually exists in the CSV.
+# Add the real header here once a real Amazon-shaped export is available.
+AMAZON_COLUMN_MAP = {
+    **BASE_COLUMN_MAP,
+    "title": ("Product Title EN/Marketing", "Title [EN]/Marketing", "Title EN/Marketing", "Title", "Product Title"),
+    "description": ("Long Description EN/Marketing", "Description [EN]/Marketing", "Description EN/Marketing", "Description", "Long Description"),
+    **{f"feature_bullet_{i}_en": (f"Feature Bullet {i} EN/Marketing", f"Bullet Point {i} EN/Marketing", f"Bullet Point {i}", f"Feature Bullet {i}")
+       for i in range(1, 6)},
+}
+
+AMAZON_TITLE_FORBIDDEN_CHARS_RE = re.compile(r"[!$?_{}^\u00ac\u00a6]")
+# Amazon barcodes must be a GTIN: 8 (EAN-8), 12 (UPC), 13 (EAN-13) or 14 digits.
+AMAZON_GTIN_LENGTHS = (8, 12, 13, 14)
+
 
 # ---------------------------------------------------------------------------
 # Marketplace configuration
@@ -283,6 +302,26 @@ class MarketplaceConfig:
     # into several Arabic (and a few English) text fields — content that
     # would very plausibly fail noon's own content QC.
     disallows_html_tags: bool = False
+
+    # Amazon: barcode must be a numeric GTIN (8/12/13/14 digits, valid GS1
+    # check digit) — or the seller holds a GTIN exemption, which this tool
+    # can't see, so a blank/invalid barcode is flagged with that reminder.
+    barcode_gtin_only: bool = False
+    # Amazon: characters that make a title fail (! $ ? _ {} ^ and the
+    # broken-bar/negation signs) — HARD rule "title_forbidden_chars".
+    title_forbidden_chars_re: "re.Pattern | None" = None
+    # Amazon: no single word may appear more than N times in the title
+    # (articles/prepositions/conjunctions excluded). None = not enforced.
+    title_max_word_repeat: "int | None" = None
+    # Amazon style guide says the brand SHOULD lead the title (the opposite
+    # of Trendyol/noon). When True, check_title_quality flags a title that
+    # doesn't contain the brand instead of one that does.
+    title_should_include_brand: bool = False
+    # Amazon allows <br> line breaks inside descriptions even though all
+    # other HTML is disallowed.
+    html_allows_br: bool = False
+    # Recommended minimum number of feature bullets (SOFT), 0 = not checked.
+    bullets_recommended_min: int = 0
 
     # Banned-word groups active for this marketplace: list of (label, terms)
     banned_word_groups: list = field(default_factory=list)
@@ -370,9 +409,59 @@ NOON_CONFIG = MarketplaceConfig(
     brand_in_title_note="noon requires brand to be excluded from the title entirely",
 )
 
+AMAZON_CONFIG = MarketplaceConfig(
+    key="amazon",
+    display_name="Amazon.sa",
+    rules_doc="Amazon_MP_QC_Rules.md",
+    column_map=AMAZON_COLUMN_MAP,
+    title_min_len=5,
+    title_max_len=200,
+    title_length_excludes_brand=False,
+    desc_min_len=0,
+    desc_max_len=2000,
+    desc_html_max_len=None,
+    has_feature_bullets=True,
+    bullet_max_len=500,
+    barcode_min_len=8,
+    barcode_max_len=14,
+    barcode_forbidden_chars_re=re.compile(r"\D"),
+    barcode_gtin_only=True,
+    has_model_code=False,
+    has_warranty_field=False,
+    has_classification_directory=False,
+    disallows_html_tags=True,
+    html_allows_br=True,
+    image_min_count=1,
+    image_max_count=9,  # 1 main + up to 8 additional
+    image_url_allowed_extensions=(".jpg", ".jpeg", ".png", ".gif", ".tif", ".tiff"),
+    image_allowed_pil_formats=("JPEG", "PNG", "GIF", "TIFF"),
+    image_min_size_bytes=1024,
+    image_max_size_bytes=10 * 1024 * 1024,
+    # Amazon: 1000px on the longest side enables zoom (500px is the floor
+    # to be accepted at all); checked on both axes here as the closest fit
+    # to the shared min_w/min_h mechanism, so a 1000x600 image that is
+    # actually fine would be flagged — kept loose at 500 for that reason.
+    image_min_w=500, image_max_w=10000, image_min_h=500, image_max_h=10000,
+    image_min_aspect_ratio=None,
+    image_min_ppi=None,
+    category_min_levels=3,
+    title_forbidden_chars_re=AMAZON_TITLE_FORBIDDEN_CHARS_RE,
+    title_max_word_repeat=2,
+    title_should_include_brand=True,
+    bullets_recommended_min=3,
+    banned_word_groups=[
+        ("unauthorized/unsubstantiated health claim", HEALTH_CLAIM_TERMS),
+        ("off-platform link/contact reference", OFF_PLATFORM_KEYWORDS),
+        ("price/shipping/promo language", PRICE_SHIPPING_PROMO_TERMS),
+        ("competitor-marketplace mention", COMPETITOR_MENTION_TERMS),
+    ],
+    brand_in_title_note="Amazon expects the brand at the start of the title",
+)
+
 MARKETPLACES = {
     "trendyol": TRENDYOL_CONFIG,
     "noon": NOON_CONFIG,
+    "amazon": AMAZON_CONFIG,
 }
 
 
@@ -444,8 +533,16 @@ def build_rule_catalogue(cfg):
     catalogue.append(("description_length", "Description length", HARD, cfg.rules_doc,
         (f"{cfg.desc_min_len}-{cfg.desc_max_len} chars"
          + (f" plain text, up to {cfg.desc_html_max_len} chars if HTML" if cfg.desc_html_max_len else ""))))
-    catalogue.append(("barcode_format", "Barcode format", HARD, cfg.rules_doc,
-        f"{cfg.barcode_min_len}-{cfg.barcode_max_len} chars, no forbidden characters; must be present."))
+    if cfg.barcode_gtin_only:
+        catalogue.append(("barcode_format", "Barcode (GTIN) format", HARD, cfg.rules_doc,
+            "Must be a numeric GTIN: 8 (EAN-8), 12 (UPC), 13 (EAN-13) or 14 digits with a valid GS1 check digit "
+            "(a GTIN exemption, if held, is invisible to this tool — flagged anyway with that reminder)."))
+    else:
+        catalogue.append(("barcode_format", "Barcode format", HARD, cfg.rules_doc,
+            f"{cfg.barcode_min_len}-{cfg.barcode_max_len} chars, no forbidden characters; must be present."))
+    if cfg.title_forbidden_chars_re is not None:
+        catalogue.append(("title_forbidden_chars", "Title special characters", HARD, cfg.rules_doc,
+            "Title must not contain ! $ ? _ { } ^ (or the broken-bar / negation signs)."))
     if cfg.has_model_code:
         catalogue.append(("model_code_format", "Model code format", HARD, cfg.rules_doc,
                            "1-40 chars, no URL/email; must be present."))
@@ -461,7 +558,7 @@ def build_rule_catalogue(cfg):
     if cfg.disallows_html_tags:
         catalogue.append(("html_content", "No HTML markup in text fields", HARD, cfg.rules_doc,
             "Title, description, feature bullets, and What's In The Box (EN and AR) must be plain text — "
-            "no HTML tags, bold, or italic formatting."))
+            "no HTML tags, bold, or italic formatting" + (" (a <br> line break is the one allowed exception)." if cfg.html_allows_br else ".")))
     catalogue.append(("price_consistency", "Price presence", HARD, cfg.rules_doc,
         "Price must be present and parseable (skipped file-wide if not present in export)."))
     catalogue.append(("category_present", "Category presence", HARD, cfg.rules_doc,
@@ -506,6 +603,10 @@ def build_rule_catalogue(cfg):
         )
     catalogue.append(("content_relevance", "Category matches product name/title/description", SOFT,
         content_relevance_source, content_relevance_condition))
+    if cfg.bullets_recommended_min:
+        catalogue.append(("bullet_count", "Feature bullet count", SOFT, cfg.rules_doc,
+            f"Amazon listings should carry at least {cfg.bullets_recommended_min} feature bullet points (up to 5) "
+            "— informational if bullets are absent from the whole export."))
     catalogue.append(("title_description_relevance", "Title matches description", SOFT, "(derived)",
         "Title and Description should share at least one significant keyword."))
     if cfg.has_warranty_field:
@@ -538,8 +639,16 @@ def load_products(csv_path, cfg):
 
     reader = csv.DictReader(io.StringIO(raw))
     rows = list(reader)
+    available_columns = set(reader.fieldnames or [])
 
-    column_map = cfg.column_map
+    # A column_map value may be a single header name or a tuple of candidate
+    # names (first one present in this CSV wins) — used by Amazon, whose
+    # Trustana export shape isn't fixed yet.
+    column_map = {}
+    for key, col in cfg.column_map.items():
+        if isinstance(col, (tuple, list)):
+            col = next((c for c in col if c in available_columns), col[0])
+        column_map[key] = col
     title_column_label = column_map.get("title", "title")
 
     products = []
@@ -601,6 +710,27 @@ def check_title_length(p, cfg):
     return [("title_length", True, "")]
 
 
+def check_title_forbidden_chars(p, cfg):
+    if cfg.title_forbidden_chars_re is None:
+        return []
+    title = p["title"]
+    if not title:
+        return []
+    found = sorted(set(cfg.title_forbidden_chars_re.findall(title)))
+    if found:
+        return [("title_forbidden_chars", False, f"Title contains character(s) not allowed in {cfg.display_name} titles: {' '.join(found)}")]
+    return [("title_forbidden_chars", True, "")]
+
+
+def check_bullet_count(p, cfg, feature_bullets_data_present):
+    if not cfg.bullets_recommended_min or not feature_bullets_data_present:
+        return []
+    n = len([b for b in p.get("feature_bullets", "").splitlines() if b.strip()])
+    if n < cfg.bullets_recommended_min:
+        return [("bullet_count", False, f"Only {n} feature bullet(s) — {cfg.display_name} listings should have at least {cfg.bullets_recommended_min} (up to 5).")]
+    return [("bullet_count", True, "")]
+
+
 def check_description_length(p, cfg):
     desc = p["description"]
     if not desc:
@@ -653,10 +783,30 @@ def check_warranty_type(p, cfg, warranty_data_present):
     return [("warranty_type_check", True, "")]
 
 
+def _gtin_check_digit_ok(digits):
+    body, check = digits[:-1], int(digits[-1])
+    total = sum(int(d) * (3 if i % 2 == 0 else 1) for i, d in enumerate(reversed(body)))
+    return (10 - total % 10) % 10 == check
+
+
+def _check_gtin(bc):
+    if not bc.isdigit():
+        return ("barcode_format", False, f"Barcode '{bc}' is not purely numeric — Amazon requires a numeric GTIN (UPC/EAN/GTIN-14).")
+    if len(bc) not in AMAZON_GTIN_LENGTHS:
+        return ("barcode_format", False, f"Barcode '{bc}' has {len(bc)} digits — a GTIN must be 8, 12, 13 or 14 digits.")
+    if not _gtin_check_digit_ok(bc):
+        return ("barcode_format", False, f"Barcode '{bc}' fails the GS1 check-digit test — Amazon will reject an invalid GTIN (typo, or a digit lost in a spreadsheet round-trip).")
+    return ("barcode_format", True, "")
+
+
 def check_barcode_format(p, cfg):
     bc = p["barcode"]
     if not bc:
+        if cfg.barcode_gtin_only:
+            return [("barcode_format", False, "Missing barcode — Amazon needs a valid GTIN unless the brand/category has a GTIN exemption approved in Seller Central (this tool can't see exemptions).")]
         return [("barcode_format", False, "Missing barcode/EAN.")]
+    if cfg.barcode_gtin_only:
+        return [_check_gtin(bc)]
     issues = []
     if not (cfg.barcode_min_len <= len(bc) <= cfg.barcode_max_len):
         issues.append(f"Barcode length {len(bc)} outside {cfg.barcode_min_len}-{cfg.barcode_max_len} char range.")
@@ -812,10 +962,15 @@ HTML_SCAN_FIELDS = (
 def check_html_content(p, cfg):
     if not cfg.disallows_html_tags:
         return []
-    hits = [key for key in HTML_SCAN_FIELDS if p.get(key) and HTML_TAG_RE.search(p[key])]
+    def _has_html(text):
+        if cfg.html_allows_br:
+            text = re.sub(r"<\s*/?\s*br\s*/?\s*>", "", text, flags=re.I)
+        return bool(HTML_TAG_RE.search(text))
+
+    hits = [key for key in HTML_SCAN_FIELDS if p.get(key) and _has_html(p[key])]
     if hits:
         return [("html_content", False,
-                  f"HTML markup (e.g. <div>/<p>/<h1>/<ul>) found in: {', '.join(hits)} — noon requires "
+                  f"HTML markup (e.g. <div>/<p>/<h1>/<ul>) found in: {', '.join(hits)} — {cfg.display_name} requires "
                   f"plain text with no HTML/bold/italic formatting in these fields; this is very likely to "
                   f"fail content QC as submitted.")]
     return [("html_content", True, "")]
@@ -826,10 +981,12 @@ def run_hard_checks(p, cfg, price_data_present, model_code_data_present,
                      classification_dir=None):
     results = []
     results += check_title_length(p, cfg)
+    results += check_title_forbidden_chars(p, cfg)
     results += check_description_length(p, cfg)
     results += check_barcode_format(p, cfg)
     results += check_model_code(p, cfg, model_code_data_present)
     results += check_feature_bullets(p, cfg, feature_bullets_data_present)
+    results += check_bullet_count(p, cfg, feature_bullets_data_present)
     results += check_image_count_and_url_format(p, cfg)
     results += check_price_consistency(p, price_data_present)
     results += check_category_present(p)
@@ -852,6 +1009,9 @@ def check_title_source(p):
     return [("title_source_fallback", True, "")]
 
 
+_TITLE_REPEAT_IGNORE = {"and", "the", "for", "with", "from", "into", "over", "pcs", "pack"}
+
+
 def check_title_quality(p, cfg):
     title, brand, cat = p["title"], p["brand"], p["category"]
     if not title:
@@ -871,8 +1031,16 @@ def check_title_quality(p, cfg):
     leaf = cat.split("/")[-1].strip().lower() if cat else ""
     if leaf and title.strip().lower() == leaf:
         issues.append("title is just the category name")
-    if brand and re.search(re.escape(brand), title, re.I):
+    if cfg.title_should_include_brand:
+        if brand and not re.search(re.escape(brand), title, re.I):
+            issues.append(f"title does not contain the brand name '{brand}' ({cfg.brand_in_title_note})")
+    elif brand and re.search(re.escape(brand), title, re.I):
         issues.append(f"title contains brand name '{brand}' ({cfg.brand_in_title_note})")
+    if cfg.title_max_word_repeat:
+        counts = Counter(w for w in words if w not in _TITLE_REPEAT_IGNORE and len(w) > 2)
+        over = sorted(w for w, n in counts.items() if n > cfg.title_max_word_repeat)
+        if over:
+            issues.append(f"word(s) repeated more than {cfg.title_max_word_repeat} times: {', '.join(over)}")
     if title.count("!") > 1 or title.count("?") > 1:
         issues.append("excessive punctuation in title")
     last_token = title.strip().split()[-1] if title.strip() else ""
@@ -1641,6 +1809,17 @@ def preview_export_breakdown(qc_result, allow_soft_issues=False):
     if qc_result["marketplace"] == "noon":
         return {"eligible": len(exported_skus), "excluded": excluded}
 
+    if qc_result["marketplace"] == "amazon":
+        # Amazon templates are per product type, and this tool has no
+        # reliable category -> Amazon product type map, so the preview groups
+        # by the export's own leaf category and the user decides which
+        # categories go into which downloaded template (see
+        # export_amazon_template(categories=...)).
+        by_category = defaultdict(int)
+        for sku in exported_skus:
+            by_category[amazon_leaf_category(products_by_sku[sku])] += 1
+        return {"by_category": dict(by_category), "eligible": len(exported_skus), "excluded": excluded}
+
     by_sheet = defaultdict(int)
     unmapped = 0
     for sku in exported_skus:
@@ -2023,6 +2202,318 @@ def export_trendyol_template(qc_result, output_path, template_path=None, allow_s
     }
 
 
+# ---------------------------------------------------------------------------
+# Stage 2, Amazon.sa: fill a category/product-type template downloaded from
+# Seller Central (Catalogue > Add Products via Upload > "Download Product
+# Spreadsheet": pick language, search/browse the product type(s), pick the
+# store, "Generate Spreadsheet"). Every product type has its own workbook, so
+# — like Trendyol — the user uploads the CURRENT template each run and this
+# function never relies on a bundled copy.
+#
+# The column layout of those workbooks is machine-readable but differs
+# between template generations (legacy flat-file names such as item_sku /
+# item_name / bullet_point1 vs. product-type-definition names such as
+# contribution_sku#1.value / item_name[...]#1.value /
+# bullet_point#1.value), so columns are located by attribute name with
+# tolerant patterns rather than by fixed position. Anything that can't be
+# located or has no source in the Trustana export is left blank and listed
+# on the 'Export Notes' sheet — never guessed.
+# ---------------------------------------------------------------------------
+_AMZ_BRACKETS_RE = re.compile(r"\[[^\]]*\]")
+_AMZ_ATTR_RE = re.compile(r"^[a-z][a-z0-9_]*(#\d+)?(\.[a-z0-9_]+(#\d+)?)*$")
+_AMZ_DATA_ROW_RE = re.compile(r"dataRow=(\d+)", re.I)
+_AMZ_ATTR_ROW_RE = re.compile(r"attributeRow=(\d+)", re.I)
+_AMZ_PRODUCT_TYPE_RE = re.compile(r"(?:productType|product_type)=([A-Za-z0-9_]+)")
+_AMZ_REQUIRED_NO_SOURCE = ()
+
+
+def amazon_leaf_category(p):
+    cat = p.get("category", "") or ""
+    return cat.split("/")[-1].strip() if cat else "(no category)"
+
+
+def _amz_base(name):
+    return _AMZ_BRACKETS_RE.sub("", str(name)).strip()
+
+
+def _amz_field_for(attr):
+    """Map one template attribute name to a logical field key, or None."""
+    a = _amz_base(attr).lower()
+    if a in ("item_sku", "sku", "seller_sku") or a.startswith("contribution_sku"):
+        return "sku"
+    if a.startswith("item_name"):
+        return "title"
+    if a in ("brand", "brand_name") or a.startswith("brand#") or a.startswith("brand_name#"):
+        return "brand"
+    if a.startswith("product_description"):
+        return "description"
+    m = re.match(r"^bullet_point(?:#)?(\d)(?:\.value)?$", a) or re.match(r"^bullet_point#(\d)\.value$", a)
+    if m and 1 <= int(m.group(1)) <= 5:
+        return f"bullet_{m.group(1)}"
+    if a in ("external_product_id", "amzn1.volt.ca.product_id_value") or (
+            a.startswith("externally_assigned_product_identifier") and a.endswith(".value")):
+        return "gtin"
+    if a in ("external_product_id_type", "amzn1.volt.ca.product_id_type") or (
+            a.startswith("externally_assigned_product_identifier") and a.endswith(".type")):
+        return "gtin_type"
+    if a == "main_image_url" or a.startswith("main_product_image_locator"):
+        return "image_1"
+    m = re.match(r"^other_image_url(\d)$", a) or re.match(r"^other_product_image_locator_(\d)", a)
+    if m and 1 <= int(m.group(1)) <= 8:
+        return f"image_{int(m.group(1)) + 1}"
+    if a == "standard_price" or ("our_price" in a and (a.endswith("value_with_tax") or a.endswith(".value"))):
+        return "price"
+    if a == "quantity" or (a.startswith("fulfillment_availability") and a.endswith("quantity")):
+        return "quantity"
+    if a in ("feed_product_type", "product_type") or a.startswith("product_type#"):
+        return "product_type"
+    return None
+
+
+def _amz_settings_text(ws):
+    """The settings string in A1 (URL-encoded key=value pairs, sometimes
+    continued in B1, C1, ...)."""
+    first = ws["A1"].value
+    return urllib.parse.unquote(first) if isinstance(first, str) else ""
+
+
+def _amz_product_type_from_settings(settings):
+    m = re.search(r"[?&]ptds=([A-Za-z0-9+/=_-]+)", "&" + settings)
+    if m:
+        try:
+            decoded = base64.b64decode(m.group(1) + "=" * (-len(m.group(1)) % 4)).decode("utf-8", "ignore")
+            types = [t for t in re.split(r"[,;|\s]+", decoded) if t]
+            if len(types) == 1:
+                return types[0]
+        except Exception:
+            pass
+    m = _AMZ_PRODUCT_TYPE_RE.search(settings)
+    return m.group(1) if m else None
+
+
+def _amz_locate_template(wb):
+    """Returns (ws, attr_row, label_row, data_row, settings_text). Uses the
+    rows the template itself declares in its A1 settings cell
+    (labelRow / attributeRow / dataRow — e.g. 4 / 5 / 7 in real Amazon.sa
+    product-type spreadsheets, with an example row in between) and falls back
+    to pattern detection for templates without them."""
+    candidates = [ws for ws in wb.worksheets if ws.title.strip().lower() in ("template", "templates")]
+    candidates += [ws for ws in wb.worksheets if ws not in candidates]
+    for ws in candidates:
+        settings = _amz_settings_text(ws)
+        ma, md, ml = (re.search(rf"{k}=(\d+)", settings) for k in ("attributeRow", "dataRow", "labelRow"))
+        if ma and md:
+            attr_row, data_row = int(ma.group(1)), int(md.group(1))
+            hit = sum(1 for c in next(ws.iter_rows(min_row=attr_row, max_row=attr_row, values_only=True))
+                      if isinstance(c, str) and _amz_field_for(c))
+            if hit >= 3:
+                return ws, attr_row, (int(ml.group(1)) if ml else None), data_row, settings
+        head = list(ws.iter_rows(min_row=1, max_row=min(ws.max_row, 15), values_only=True))
+        best, best_n = None, 0
+        for idx, row in enumerate(head, start=1):
+            n = sum(1 for c in row if isinstance(c, str) and _AMZ_ATTR_RE.match(_amz_base(c)) and _amz_field_for(c))
+            if n > best_n:
+                best, best_n = idx, n
+        if best is None or best_n < 3:
+            continue
+        data_row = best + 1
+        while data_row <= ws.max_row and any(c is not None and str(c).strip() for c in
+                                              next(ws.iter_rows(min_row=data_row, max_row=data_row, values_only=True))):
+            data_row += 1
+        label_row = None
+        best_text = 0
+        for idx in range(1, best):
+            n = sum(1 for c in head[idx - 1] if isinstance(c, str) and c.strip())
+            if n > best_text and not str(head[idx - 1][0] or "").startswith("settings"):
+                label_row, best_text = idx, n
+        return ws, best, label_row, data_row, settings
+    raise ValueError(
+        "Couldn't find the product data section in this workbook — expected a 'Template' sheet with attribute "
+        "names such as contribution_sku#1.value / item_name / brand. Make sure this is the spreadsheet generated by "
+        "Seller Central's 'Download Product Spreadsheet' for a product type, not an inventory/price file."
+    )
+
+
+def _amz_requirements(wb):
+    """{normalised field name: 'Required'|'Conditionally Required'|...} from the
+    workbook's 'Data Definitions' sheet (Field Name / Required? columns)."""
+    out = {}
+    ws = next((w for w in wb.worksheets if w.title.strip().lower() == "data definitions"), None)
+    if ws is None:
+        return out
+    header_idx = None
+    for idx, row in enumerate(ws.iter_rows(min_row=1, max_row=10, values_only=True), start=1):
+        if row and "Field Name" in row and any(isinstance(c, str) and c.startswith("Required") for c in row):
+            header_idx, header = idx, list(row)
+            break
+    if header_idx is None:
+        return out
+    fi = header.index("Field Name")
+    ri = next(i for i, c in enumerate(header) if isinstance(c, str) and c.startswith("Required"))
+    for row in ws.iter_rows(min_row=header_idx + 1, values_only=True):
+        if row[fi] and row[ri]:
+            out[_amz_norm_attr(row[fi])] = str(row[ri]).strip()
+    return out
+
+
+def _amz_norm_attr(name):
+    """Normalise an attribute name so a Data Definitions entry (which omits
+    the trailing '#1.value') lines up with its Template column."""
+    n = str(name).strip()
+    n = re.sub(r"#1\.value$", "", n)
+    n = re.sub(r"#1$", "", n)
+    return n
+
+
+def _amz_gtin_type(gtin):
+    return {8: "EAN", 12: "UPC", 13: "EAN", 14: "GTIN"}.get(len(gtin), "")
+
+
+def export_amazon_template(qc_result, output_path, template_path, allow_soft_issues=False, categories=None, notes_path=None):
+    """Fill an Amazon.sa product-type spreadsheet (downloaded from Seller
+    Central's 'Download Product Spreadsheet') with QC-clean products.
+    `categories` (list of leaf-category names from the export) restricts
+    which products go into THIS template — pass the categories that belong
+    to this template's product type; None = every eligible product.
+    The upload workbook itself is written untouched apart from the data rows;
+    review notes + the excluded list go to a companion workbook at
+    `notes_path` (default: <output stem>_notes.xlsx). Returns a summary dict."""
+    if qc_result["marketplace"] != "amazon":
+        raise ValueError("export_amazon_template() is only valid for marketplace='amazon' QC results.")
+    template_path = Path(template_path)
+    if not template_path.exists():
+        raise FileNotFoundError(f"Amazon template not found at {template_path}")
+
+    keep_vba = template_path.suffix.lower() == ".xlsm"
+    wb = openpyxl.load_workbook(template_path, keep_vba=keep_vba)
+    ws, attr_row, label_row, data_row, settings = _amz_locate_template(wb)
+    pt_hint = _amz_product_type_from_settings(settings)
+    requirements = _amz_requirements(wb)
+
+    attr_cells = list(ws.iter_rows(min_row=attr_row, max_row=attr_row))[0]
+    col_of = {}
+    for c in attr_cells:
+        if c.value is None:
+            continue
+        field_key = _amz_field_for(c.value)
+        if field_key and field_key not in col_of:
+            col_of[field_key] = c.column
+
+    # Product type: hint from settings, else an unambiguous single-value
+    # data validation on that column.
+    product_type = pt_hint
+    if not product_type and "product_type" in col_of:
+        letter = get_column_letter(col_of["product_type"])
+        for dv in ws.data_validations.dataValidation:
+            if dv.formula1 and str(dv.formula1).startswith('"') and "," not in dv.formula1:
+                if any(letter in str(rng) for rng in dv.sqref.ranges):
+                    product_type = dv.formula1.strip('"')
+                    break
+
+    products_by_sku = {p["sku"]: p for p in qc_result["products"]}
+    eligible = clean_skus(qc_result, allow_soft_issues=allow_soft_issues)
+    all_skus = [p["sku"] for p in qc_result["products"]]
+    if categories is not None:
+        wanted = set(categories)
+        chosen = [s_ for s_ in eligible if amazon_leaf_category(products_by_sku[s_]) in wanted]
+    else:
+        chosen = list(eligible)
+    excluded_skus = [s_ for s_ in all_skus if s_ not in set(chosen)]
+    not_selected = [s_ for s_ in eligible if s_ not in set(chosen)]
+    hard_or_soft_excluded = [s_ for s_ in all_skus if s_ not in set(eligible)]
+
+    filled_fields = set()
+    r = data_row
+    for sku in chosen:
+        p = products_by_sku[sku]
+        values = {
+            "sku": p["sku"], "title": p["title"], "brand": p["brand"], "description": p["description"],
+            "gtin": p["barcode"], "gtin_type": _amz_gtin_type(p["barcode"]),
+            "price": p.get("price", ""), "quantity": p.get("stock", ""),
+            "product_type": product_type or "",
+        }
+        bullets = [b.strip() for b in p.get("feature_bullets", "").splitlines() if b.strip()]
+        for i in range(1, 6):
+            values[f"bullet_{i}"] = bullets[i - 1] if i <= len(bullets) else ""
+        for i in range(1, 10):
+            values[f"image_{i}"] = p["images_list"][i - 1] if i <= len(p["images_list"]) else ""
+        for key, val in values.items():
+            if key in col_of and val not in (None, ""):
+                ws.cell(row=r, column=col_of[key], value=_xlsx_safe(val))
+                filled_fields.add(key)
+        r += 1
+
+    # Which template columns does Amazon mark Required / Conditionally
+    # Required (per the workbook's own Data Definitions sheet) that this tool
+    # could not fill? Only the first column of a repeated attribute (#1) counts.
+    unfilled_required, unfilled_conditional = [], []
+    if requirements:
+        for c in attr_cells:
+            if c.value is None:
+                continue
+            attr = str(c.value)
+            if re.search(r"#([2-9]|\d{2,})(\.|$)", attr):
+                continue
+            status = requirements.get(_amz_norm_attr(attr))
+            if status not in ("Required", "Conditionally Required"):
+                continue
+            fk = _amz_field_for(attr)
+            if fk is not None and fk in filled_fields:
+                continue
+            label = ws.cell(row=label_row, column=c.column).value if label_row else None
+            entry = f"{label or _amz_base(attr)} ({_amz_base(attr)})"
+            (unfilled_required if status == "Required" else unfilled_conditional).append(entry)
+
+    # The upload workbook is left exactly as Amazon generated it (no extra
+    # sheets that could upset Amazon's upload validator); the review notes and
+    # the excluded-products list go into a separate companion workbook.
+    out = Path(output_path)
+    if keep_vba and out.suffix.lower() != ".xlsm":
+        raise ValueError("Output path must end in .xlsm when the template is a macro-enabled .xlsm workbook.")
+    wb.save(output_path)
+    if keep_vba and getattr(wb, "vba_archive", None) is not None:
+        wb.vba_archive.close()
+
+    notes_wb = Workbook()
+    notes = notes_wb.active
+    notes.title = "Export Notes"
+    notes.append(["Amazon.sa stage-2 export notes"])
+    notes["A1"].font = Font(bold=True, size=14)
+    notes.append([f"Wrote {len(chosen)} QC-clean product(s) into sheet '{ws.title}' of {out.name}, starting at row {data_row}."])
+    if categories is not None:
+        notes.append([f"Categories assigned to this template: {', '.join(sorted(categories)) or '(none)'}."])
+    if not_selected:
+        notes.append([f"{len(not_selected)} QC-clean product(s) from other categories were not put in this template (they belong in other product-type templates)."])
+    notes.append([f"{len(hard_or_soft_excluded)} product(s) failed the QC threshold — see the 'Excluded From Export' sheet."])
+    notes.append([f"Product type: {product_type or 'not detected from this template — check the Product Type column'}."])
+    notes.append([])
+    missing_fields = [k for k in ("sku", "title", "brand", "description", "gtin", "image_1") if k not in col_of]
+    if missing_fields:
+        notes.append(["Template columns this tool could not locate (fill manually if present): " + ", ".join(missing_fields)])
+    notes.append(["Filled from the QC-verified export: SKU, product type, title, brand, description, bullet points, product ID + type (from GTIN length), images, price and quantity where the export has them."])
+    notes.append(["Left blank — no source in the Trustana export; fill in the upload file before submitting."])
+    if unfilled_required:
+        notes.append([])
+        notes.append([f"Marked 'Required' in this template and still empty ({len(unfilled_required)}):"])
+        for item in unfilled_required:
+            notes.append(["  - " + item])
+    if unfilled_conditional:
+        notes.append([])
+        notes.append([f"Marked 'Conditionally Required' and still empty ({len(unfilled_conditional)}) — needed depending on the product; check Amazon's Data Definitions sheet:"])
+        for item in unfilled_conditional:
+            notes.append(["  - " + item])
+    _autosize(notes, [140])
+    _write_excluded_sheet(notes_wb, qc_result, hard_or_soft_excluded, allow_soft_issues=allow_soft_issues)
+    notes_path = str(notes_path) if notes_path else str(out.with_name(out.stem + "_notes.xlsx"))
+    notes_wb.save(notes_path)
+
+    return {
+        "exported": len(chosen), "excluded": len(hard_or_soft_excluded), "other_categories": len(not_selected),
+        "product_type": product_type, "unfilled_required": unfilled_required,
+        "unfilled_conditional": unfilled_conditional, "notes_path": notes_path,
+        "sheet": ws.title, "data_row": data_row, "located_fields": sorted(col_of),
+    }
+
 def main():
     parser = argparse.ArgumentParser(description="Trustana AI Content Verifier for MP — checks a Trustana export against a marketplace's listing rules.")
     parser.add_argument("csv_path", help="Path to the Trustana product export CSV")
@@ -2032,7 +2523,7 @@ def main():
     parser.add_argument("--max-image-checks", type=int, default=500, help="Cap on number of images to download when --verify-images is set")
     parser.add_argument("--export-template", metavar="OUTPUT_XLSX",
                          help="Also fill the marketplace's own upload template with every QC-clean product and write it here "
-                              "(noon: template_data sheet; Trendyol: matching category sheet(s)). Use --template-file to point "
+                              "(noon: template_data sheet; Trendyol: matching category sheet(s); Amazon: the product-type spreadsheet from Seller Central). Use --template-file to point "
                               "at a freshly-downloaded template — otherwise falls back to the bundled noon_template.xlsx / "
                               "trendyol_template.xlsx, which may not match your current category selection (Trendyol's "
                               "template varies per category requested from Trendyol).")
@@ -2045,6 +2536,9 @@ def main():
     parser.add_argument("--allow-soft-issues", action="store_true",
                          help="Relax stage-2 export eligibility from 'zero issues of any kind' to 'zero HARD (rejection-risk) issues' "
                               "— quality nitpicks like a brand name in the title won't block export. Only affects --export-template.")
+    parser.add_argument("--amazon-categories", metavar="CAT1,CAT2",
+                         help="Amazon only: comma-separated leaf categories (from the export) to place in the template given by "
+                              "--template-file — each Amazon template covers one product type. Default: every eligible product.")
     args = parser.parse_args()
 
     qc_result = run_qc(args.csv_path, marketplace=args.marketplace, verify_images=args.verify_images, max_image_checks=args.max_image_checks)
@@ -2056,13 +2550,26 @@ def main():
 
     if args.export_template:
         n_clean = len(clean_skus(qc_result, allow_soft_issues=args.allow_soft_issues))
-        if not args.template_file:
+        if not args.template_file and args.marketplace != "amazon":
             print("NOTE: no --template-file given — falling back to the bundled template shipped with this tool. "
                   "For Trendyol especially, this may not match your current category selection; download the "
                   "current template from the marketplace and pass it via --template-file for an accurate export.")
         if args.marketplace == "noon":
             n_exp, n_exc = export_noon_template(qc_result, args.export_template, template_path=args.template_file, allow_soft_issues=args.allow_soft_issues)
             print(f"Stage-2 export: {n_exp} product(s) written to {args.export_template} ({n_exc} excluded).")
+        elif args.marketplace == "amazon":
+            if not args.template_file:
+                sys.exit("Amazon export needs --template-file: download the product-type spreadsheet from Seller Central "
+                         "(Catalogue > Add Products via Upload > Download Product Spreadsheet) first.")
+            cats = [c.strip() for c in args.amazon_categories.split(",") if c.strip()] if args.amazon_categories else None
+            summary = export_amazon_template(qc_result, args.export_template, args.template_file,
+                                              allow_soft_issues=args.allow_soft_issues, categories=cats)
+            print(f"Stage-2 export: {summary['exported']} product(s) written to sheet '{summary['sheet']}' of {args.export_template} "
+                  f"({summary['excluded']} excluded, {summary['other_categories']} left for other templates).")
+            print(f"Review notes + excluded products: {summary['notes_path']}")
+            if summary["unfilled_required"]:
+                print("NOTE: still empty but marked Required in the template: "
+                      + "; ".join(e.split(" (")[0] for e in summary["unfilled_required"]))
         else:
             summary = export_trendyol_template(qc_result, args.export_template, template_path=args.template_file, allow_soft_issues=args.allow_soft_issues)
             print(f"Stage-2 export: {summary['exported_to_sheets']} product(s) written into category sheets, "

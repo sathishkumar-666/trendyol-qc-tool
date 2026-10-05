@@ -3,7 +3,7 @@
 Checks a Trustana product export (CSV) against a marketplace's listing
 rules, produces an Excel QC report, and — for every product that passes —
 can fill that marketplace's own upload template so it's ready to submit.
-Currently supports **Trendyol** and **noon**, with more marketplaces
+Currently supports **Trendyol**, **noon** and **Amazon.sa**, with more marketplaces
 addable without touching the shared checking logic (see "When a
 marketplace's rules change" below). Built from `Trendyol_MP_QC_Rules.md`
 (Trendyol's public Platform Rules, upload field formats, rejection reasons,
@@ -185,6 +185,36 @@ pip install -r requirements.txt
 python3 qc_engine.py Products_export.csv QC_Report.xlsx --marketplace trendyol [--verify-images]
 python3 qc_engine.py Products_export.csv QC_Report.xlsx --marketplace noon [--verify-images]
 ```
+
+## Amazon.sa
+
+Pick **Amazon.sa** in the dropdown (or `--marketplace amazon`). Rules are in
+`Amazon_MP_QC_Rules.md`: title ≤ 200 chars with the **brand included**, no
+`! $ ? _ { } ^`, description ≤ 2,000 chars with no HTML (except `<br>`),
+≤ 5 bullets of ≤ 500 chars, a valid numeric **GTIN** (8/12/13/14 digits, GS1
+check digit), and 1–9 images (JPEG/PNG/GIF/TIFF).
+
+**Stage 2 for Amazon** works per product type, because Seller Central
+generates one spreadsheet per product type:
+
+1. Run QC → *Generate export summary* (shows eligible products per category).
+2. In Seller Central: *Catalogue → Add Products via Upload → Download Product
+   Spreadsheet* → English (Amazon.sa) → select the product type → Amazon.sa →
+   *Generate Spreadsheet*. Repeat per product type.
+3. Upload each spreadsheet (`.xlsx` / `.xlsm`) in the app, choose which export
+   categories belong in it, and click **Fill template(s) & download**.
+
+CLI: `./run_qc.sh Products.csv amazon --export-template out.xlsm --template-file SAUTE_FRY_PAN.xlsm --amazon-categories "Frying Pan,Woks"`.
+
+The filler reads the template's own `labelRow / attributeRow / dataRow`
+settings (row 5 = attribute names, data from row 7 in current Amazon.sa
+spreadsheets) and finds columns by attribute name (`contribution_sku#1.value`,
+`item_name…`, `bullet_point…`, `amzn1.volt.ca.product_id_*`, …). The upload
+file is left exactly as Amazon generated it apart from the data rows; a second
+file, `…_notes.xlsx`, lists the columns Amazon marks *Required* /
+*Conditionally Required* that are still empty (condition, country of origin,
+browse node, product-type attributes, …) and the products excluded by QC.
+Nothing is guessed.
 
 ## Stage 2: filling the marketplace upload template
 

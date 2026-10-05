@@ -24,6 +24,7 @@ from qc_engine import (
     build_report,
     build_rule_catalogue,
     clean_skus,
+    export_amazon_template,
     export_noon_template,
     export_trendyol_template,
     get_marketplace_config,
@@ -130,6 +131,7 @@ if run_clicked and uploaded is not None:
     st.session_state.pop("export_bytes", None)
     st.session_state.pop("export_summary", None)
     st.session_state.pop("export_preview", None)
+    st.session_state.pop("amazon_exports", None)
 
 qc_result = st.session_state.get("qc_result")
 if qc_result is not None and st.session_state.get("marketplace_key") == marketplace_key:
@@ -212,12 +214,20 @@ if qc_result is not None and st.session_state.get("marketplace_key") == marketpl
         st.session_state["export_preview"] = preview_export_breakdown(qc_result, allow_soft_issues=allow_soft_issues)
         st.session_state.pop("export_bytes", None)
         st.session_state.pop("export_summary", None)
+        st.session_state.pop("amazon_exports", None)
 
     if "export_preview" in st.session_state:
         preview = st.session_state["export_preview"]
         st.markdown("**QC summary for manual checking, before filling any template:**")
         if marketplace_key == "noon":
             st.write(f"- **{preview['eligible']}** product(s) are ready to be written into noon's `template_data` sheet.")
+        elif marketplace_key == "amazon":
+            for cat_name, count in sorted(preview["by_category"].items()):
+                st.write(f"- **{count}** product(s) in category `{cat_name}`")
+            st.write(
+                "Amazon uses one spreadsheet per product type, so below you upload one template per product type "
+                "and choose which of these categories go into it."
+            )
         else:
             for sheet_name, count in sorted(preview["by_sheet"].items()):
                 st.write(f"- **{count}** product(s) → `{sheet_name}`")
@@ -229,44 +239,106 @@ if qc_result is not None and st.session_state.get("marketplace_key") == marketpl
         st.write(f"- **{preview['excluded']}** product(s) are excluded — see the QC report's Issues sheet for why.")
         st.write("Review this against your catalog before continuing. Once it looks right:")
 
-        st.info(
-            f"**Download the current upload template from {cfg.display_name}'s seller center** — not a saved copy — "
-            "and upload it below. This matters especially for Trendyol, where the template you download only includes "
-            "sheets for the categories you selected when requesting it, so a template downloaded for a different "
-            "category mix won't match this catalog. noon's template is more stable but can still change, so it's "
-            "safest to always use a freshly-downloaded copy."
-        )
+        if marketplace_key == "amazon":
+            st.info(
+                "**Download the current product spreadsheet(s) from Seller Central** — Catalogue → Add Products via "
+                "Upload → *Download Product Spreadsheet*: choose English (Amazon.sa), search/browse and select the "
+                "product type, pick the Amazon.sa store and click *Generate Spreadsheet*. Do this once per product "
+                "type (e.g. *Sauté & Frying Pan*), then upload every file below. A freshly-downloaded copy is "
+                "always safest — attribute columns and allowed values differ per product type and change over time."
+            )
+        else:
+            st.info(
+                f"**Download the current upload template from {cfg.display_name}'s seller center** — not a saved copy — "
+                "and upload it below. This matters especially for Trendyol, where the template you download only includes "
+                "sheets for the categories you selected when requesting it, so a template downloaded for a different "
+                "category mix won't match this catalog. noon's template is more stable but can still change, so it's "
+                "safest to always use a freshly-downloaded copy."
+            )
 
-        template_upload = st.file_uploader(
-            f"Current {cfg.display_name} upload template (.xlsx)",
-            type=["xlsx"],
-            key=f"template_upload_{marketplace_key}",
-        )
+        if marketplace_key == "amazon":
+            template_uploads = st.file_uploader(
+                "Current Amazon.sa product spreadsheet(s) — one per product type (.xlsx / .xlsm)",
+                type=["xlsx", "xlsm"],
+                accept_multiple_files=True,
+                key="template_upload_amazon",
+            )
+            category_options = sorted(preview["by_category"].keys())
+            assignments = {}
+            for tf in template_uploads or []:
+                assignments[tf.name] = st.multiselect(
+                    f"Categories to put in {tf.name}",
+                    options=category_options,
+                    default=category_options if len(template_uploads) == 1 else [],
+                    key=f"amazon_cats_{tf.name}",
+                    help="Each Amazon spreadsheet is for a single product type — pick the export categories that belong to it.",
+                )
+            ready = bool(template_uploads) and all(assignments.get(tf.name) for tf in template_uploads)
+            if template_uploads and not ready:
+                st.caption("Pick at least one category for every uploaded spreadsheet.")
+            if st.button("Fill template(s) & download", disabled=not ready, type="primary"):
+                results = []
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    for tf in template_uploads:
+                        template_path = os.path.join(tmpdir, tf.name)
+                        with open(template_path, "wb") as f:
+                            f.write(tf.getbuffer())
+                        ext = os.path.splitext(tf.name)[1].lower()
+                        export_path = os.path.join(tmpdir, f"export_{len(results)}{ext}")
+                        try:
+                            summary = export_amazon_template(
+                                qc_result, export_path, template_path,
+                                allow_soft_issues=allow_soft_issues, categories=assignments[tf.name],
+                            )
+                            with open(export_path, "rb") as f:
+                                data = f.read()
+                            with open(summary["notes_path"], "rb") as f:
+                                notes_data = f.read()
+                            text = f"{tf.name}: {summary['exported']} product(s) written"
+                            if summary["product_type"]:
+                                text += f" (product type {summary['product_type']})"
+                            if summary["unfilled_required"]:
+                                text += (f". Still empty but marked Required in the template: "
+                                         + "; ".join(e.split(" (")[0] for e in summary["unfilled_required"]))
+                            if summary["unfilled_conditional"]:
+                                text += f". {len(summary['unfilled_conditional'])} Conditionally Required column(s) also empty — see the notes file"
+                            stem = os.path.splitext(tf.name)[0]
+                            results.append({"name": f"{base_name}_amazon_{stem}{ext}", "data": data, "text": text, "ext": ext,
+                                            "notes_name": f"{base_name}_amazon_{stem}_notes.xlsx", "notes_data": notes_data})
+                        except Exception as e:
+                            st.error(f"Couldn't fill {tf.name}: {e}")
+                st.session_state["amazon_exports"] = results
+        else:
+            template_upload = st.file_uploader(
+                f"Current {cfg.display_name} upload template (.xlsx)",
+                type=["xlsx"],
+                key=f"template_upload_{marketplace_key}",
+            )
 
-        if st.button("Fill template & download", disabled=template_upload is None, type="primary"):
-            with tempfile.TemporaryDirectory() as tmpdir:
-                template_path = os.path.join(tmpdir, template_upload.name)
-                with open(template_path, "wb") as f:
-                    f.write(template_upload.getbuffer())
-                export_path = os.path.join(tmpdir, "export.xlsx")
-                try:
-                    if marketplace_key == "noon":
-                        n_exp, n_exc = export_noon_template(qc_result, export_path, template_path=template_path, allow_soft_issues=allow_soft_issues)
-                        summary_text = f"Exported {n_exp} product(s) into noon's template_data sheet ({n_exc} excluded — see 'Excluded From Export')."
-                    else:
-                        summary = export_trendyol_template(qc_result, export_path, template_path=template_path, allow_soft_issues=allow_soft_issues)
-                        summary_text = (
-                            f"Exported {summary['exported_to_sheets']} product(s) into their matching Trendyol category sheet(s), "
-                            f"{summary['leftover']} into 'Leftover - Needs Template' (no matching sheet in the template you uploaded), "
-                            f"{summary['excluded']} excluded."
-                        )
-                        if summary["attribute_warnings"]:
-                            summary_text += f" {summary['attribute_warnings']} attribute value(s) flagged in 'Attribute Value Warnings' — double-check those before uploading."
-                    with open(export_path, "rb") as f:
-                        st.session_state["export_bytes"] = f.read()
-                    st.session_state["export_summary"] = summary_text
-                except Exception as e:
-                    st.error(f"Couldn't generate the export: {e}. Make sure the file you uploaded is really this marketplace's upload template.")
+            if st.button("Fill template & download", disabled=template_upload is None, type="primary"):
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    template_path = os.path.join(tmpdir, template_upload.name)
+                    with open(template_path, "wb") as f:
+                        f.write(template_upload.getbuffer())
+                    export_path = os.path.join(tmpdir, "export.xlsx")
+                    try:
+                        if marketplace_key == "noon":
+                            n_exp, n_exc = export_noon_template(qc_result, export_path, template_path=template_path, allow_soft_issues=allow_soft_issues)
+                            summary_text = f"Exported {n_exp} product(s) into noon's template_data sheet ({n_exc} excluded — see 'Excluded From Export')."
+                        else:
+                            summary = export_trendyol_template(qc_result, export_path, template_path=template_path, allow_soft_issues=allow_soft_issues)
+                            summary_text = (
+                                f"Exported {summary['exported_to_sheets']} product(s) into their matching Trendyol category sheet(s), "
+                                f"{summary['leftover']} into 'Leftover - Needs Template' (no matching sheet in the template you uploaded), "
+                                f"{summary['excluded']} excluded."
+                            )
+                            if summary["attribute_warnings"]:
+                                summary_text += f" {summary['attribute_warnings']} attribute value(s) flagged in 'Attribute Value Warnings' — double-check those before uploading."
+                        with open(export_path, "rb") as f:
+                            st.session_state["export_bytes"] = f.read()
+                        st.session_state["export_summary"] = summary_text
+                    except Exception as e:
+                        st.error(f"Couldn't generate the export: {e}. Make sure the file you uploaded is really this marketplace's upload template.")
 
     if "export_bytes" in st.session_state:
         st.success(st.session_state["export_summary"])
@@ -276,6 +348,24 @@ if qc_result is not None and st.session_state.get("marketplace_key") == marketpl
             file_name=f"{base_name}_{marketplace_key}_marketplace_upload.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
+        )
+
+    for idx, item in enumerate(st.session_state.get("amazon_exports", []) if marketplace_key == "amazon" else []):
+        st.success(item["text"])
+        st.download_button(
+            label=f"Download {item['name']}",
+            data=item["data"],
+            file_name=item["name"],
+            mime="application/vnd.ms-excel.sheet.macroEnabled.12" if item["ext"] == ".xlsm" else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            key=f"amazon_dl_{idx}",
+        )
+        st.download_button(
+            label=f"Download review notes + excluded products ({item['notes_name']})",
+            data=item["notes_data"],
+            file_name=item["notes_name"],
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            key=f"amazon_notes_{idx}",
         )
 
 st.divider()
